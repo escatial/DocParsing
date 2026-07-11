@@ -1,0 +1,16 @@
+# 项目根目录 .gitignore
+
+# 测试输出
+.coverage
+htmlcov/
+
+# 系统
+Thumbs.db
+.DS_Store
+ehthumbs.db
+Desktop.ini
+
+# 临时文件
+*.tmp
+*.bak
+*.swp
