@@ -1,10 +1,12 @@
 """
-MinerU MVP 后端
+MinerU DocParser 后端
 - 作为 MinerU 云 API 的代理层，避免前端泄露 Token
-- 暴露文件上传 -> 任务提交 -> 进度轮询 -> 结果下载四个端点
+- 暴露文件上传 -> 任务提交 -> 进度轮询 -> 结果下载
+- 对 docx 文件做脚注后处理（[] -> Word 真实脚注）
 """
 import asyncio
 import base64
+import io
 import json
 import os
 import re
@@ -12,7 +14,11 @@ import time
 import uuid
 import urllib.parse
 import zipfile
-import io
+
+from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn, nsmap
+from docx.shared import Pt, RGBColor
 from typing import Optional
 
 import httpx
@@ -755,6 +761,235 @@ def _extract_refs_from_markdown(md: str) -> list[str]:
     return refs[:50]  # 最多 50 条防溢出
 
 
+# ============ Docx 脚注后处理 ============
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def _parse_inline_references(md: str) -> list[dict]:
+    """从 Markdown 中解析行内引用 [1] [2] 及其位置"""
+    refs = []
+    pattern = re.compile(r"\[(\d+)\]")
+    for m in pattern.finditer(md):
+        refs.append({"num": int(m.group(1)), "raw": m.group(0)})
+    # 去重保留首次出现顺序
+    seen = set()
+    unique = []
+    for r in refs:
+        if r["num"] not in seen:
+            seen.add(r["num"])
+            unique.append(r)
+    return unique
+
+
+def _extract_refs_dict_from_md(md: str) -> dict[int, str]:
+    """从 Markdown 末尾的参考文献列表中提取 {num: text}"""
+    refs_dict: dict[int, str] = {}
+    in_refs = False
+    pattern = re.compile(r"^\s*\[(\d+)\][\.\s]*(.+)$")
+    for line in md.split("\n"):
+        stripped = line.strip()
+        if re.match(r"^#{1,3}\s*(参考文献|References?|Bibliography|引用文献|REFERENCES)", stripped, re.I):
+            in_refs = True
+            continue
+        if in_refs and re.match(r"^#{1,3}\s+", stripped):
+            in_refs = False
+        if in_refs:
+            m = pattern.match(stripped)
+            if m:
+                refs_dict[int(m.group(1))] = m.group(2).strip()
+    return refs_dict
+
+
+def _process_docx_with_footnotes(docx_bytes: bytes, references: list[str]) -> bytes:
+    """
+    将 MinerU 生成的 docx 中的 [N] 引用转换为 Word 真实脚注。
+
+    策略：
+    1. 在 docx 末尾插入 Footnote XML 部件（如果不存在）
+    2. 把每个 [N] 文本替换为 footnoteReference
+    3. 在 footnotes.xml 中添加对应的 footnote 节点
+    """
+    try:
+        doc = Document(io.BytesIO(docx_bytes))
+    except Exception as e:
+        print(f"[process_docx_footnotes] 打开 docx 失败: {e}")
+        return docx_bytes
+
+    # 收集 references 列表（按编号排序）
+    # 如果 references 是 ["[1] xxx", "[2] yyy"]，需要解析成 dict
+    refs_dict: dict[int, str] = {}
+    for ref in references:
+        m = re.match(r"^\s*\[?(\d+)\]?[\.\s]*(.+)$", ref.strip())
+        if m:
+            refs_dict[int(m.group(1))] = m.group(2).strip()
+
+    if not refs_dict:
+        print("[process_docx_footnotes] 没有可用的参考文献，不处理")
+        return docx_bytes
+
+    # 1. 扫描文档中所有 [N] 文本
+    # python-docx 不直接支持正则替换 paragraph text，我们用 XML 操作
+    # 对每个段落，将 w:t 文本节点按 [N] 拆分，并在中间插入 footnoteReference
+    body = doc.element.body
+    fn_id = 100  # 脚注 ID 起始值（避免与默认 0/1 冲突）
+    inserted: list[int] = []  # 已插入的编号列表
+
+    # 遍历所有段落
+    for p in body.iter(qn("w:p")):
+        # 收集段落的所有 w:r/w:t 节点
+        runs_with_text = []
+        for r in p.findall(qn("w:r")):
+            for t in r.findall(qn("w:t")):
+                runs_with_text.append((r, t, t.text or ""))
+
+        if not runs_with_text:
+            continue
+
+        # 拼接段落文本，标记每个 t 的位置
+        full_text = ""
+        boundaries = []  # [(start, end, run, text_elem)]
+        for r, t, txt in runs_with_text:
+            start = len(full_text)
+            full_text += txt
+            boundaries.append((start, len(full_text), r, t))
+
+        # 找所有 [N]
+        pattern = re.compile(r"\[(\d+)\]")
+        matches = list(pattern.finditer(full_text))
+        if not matches:
+            continue
+
+        # 反向处理 matches（避免位置偏移）
+        # 这里采用简化策略：把 [N] 替换为脚注引用，保留原文本结构
+        # 由于跨 w:r 拆分复杂，我们直接对每个 w:t 节点单独处理
+        for r, t, txt in runs_with_text:
+            new_text = txt
+            sub_matches = list(pattern.finditer(new_text))
+            if not sub_matches:
+                continue
+            # 在 t 后面依次插入 footnoteReference runs
+            # 简化：把 t 拆成多段，前后是 w:r/w:t，中间是 w:r/footnoteReference
+            # 先清空原 t 的内容
+            parent_run = t.getparent()  # w:r
+            parent_para = parent_run.getparent()  # w:p
+            run_index = list(parent_para).index(parent_run)
+
+            # 在 run_index 后插入新节点
+            cursor = run_index + 1
+            # 把原 t 的文本按 [N] 拆分
+            cursor_text = 0
+            new_runs_to_insert = []
+            for sm in sub_matches:
+                num = int(sm.group(1))
+                if num not in refs_dict or num in inserted:
+                    # 引用不存在或已插入过 → 跳过替换（保留原文本）
+                    continue
+                # 前段文本
+                pre = new_text[cursor_text:sm.start()]
+                if pre:
+                    pre_run = OxmlElement("w:r")
+                    pre_t = OxmlElement("w:t")
+                    pre_t.text = pre
+                    pre_t.set(qn("xml:space"), "preserve")
+                    pre_run.append(pre_t)
+                    new_runs_to_insert.append(pre_run)
+                # 脚注引用 run
+                fn_run = OxmlElement("w:r")
+                rpr = OxmlElement("w:rPr")
+                rstyle = OxmlElement("w:rStyle")
+                rstyle.set(qn("w:val"), "FootnoteReference")
+                rpr.append(rstyle)
+                fn_run.append(rpr)
+                fn_ref = OxmlElement("w:footnoteReference")
+                fn_ref.set(qn("w:id"), str(fn_id))
+                fn_run.append(fn_ref)
+                new_runs_to_insert.append(fn_run)
+                inserted.append(num)
+                fn_id += 1
+                cursor_text = sm.end()
+            # 剩余文本
+            rest = new_text[cursor_text:]
+            if rest:
+                rest_run = OxmlElement("w:r")
+                rest_t = OxmlElement("w:t")
+                rest_t.text = rest
+                rest_t.set(qn("xml:space"), "preserve")
+                rest_run.append(rest_t)
+                new_runs_to_insert.append(rest_run)
+            # 把 t 清空（保留为空），后续整段替换
+            t.text = ""
+            # 在 parent_run 之后插入新 runs
+            for offset, nr in enumerate(new_runs_to_insert):
+                parent_para.insert(run_index + 1 + offset, nr)
+            # 删除原 run（如果已无内容）
+            if not any(rt.text for rt in parent_run.findall(qn("w:t"))):
+                parent_para.remove(parent_run)
+
+    if not inserted:
+        print("[process_docx_footnotes] 文档中未找到任何 [N] 引用，未处理")
+        return docx_bytes
+
+    print(f"[process_docx_footnotes] 已插入 {len(inserted)} 个脚注引用，编号: {inserted[:5]}...")
+
+    # 2. 注册 footnotes part（如果 docx 没有则新建）
+    _ensure_footnotes_part(doc, refs_dict, inserted)
+
+    # 3. 保存
+    output = io.BytesIO()
+    doc.save(output)
+    return output.getvalue()
+
+
+def _ensure_footnotes_part(doc, refs_dict: dict[int, str], inserted: list[int]):
+    """在 docx 中注册 footnotes.xml 部件，添加脚注内容"""
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT, CONTENT_TYPE as CT
+    from docx.opc.part import Part
+    from docx.opc.packuri import PackURI
+
+    package = doc.part.package
+    # 检查是否已有 footnotes part
+    footnotes_part = None
+    for rel in doc.part.rels.values():
+        if rel.reltype == RT.FOOTNOTES:
+            footnotes_part = rel.target_part
+            break
+
+    # 构造 footnotes.xml 内容
+    fn_xml_parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+                    f'<w:footnotes xmlns:w="{W_NS}">',
+                    '  <w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>',
+                    '  <w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>']
+
+    # ID 从 100 开始（与 process_docx 中 fn_id 一致）
+    for offset, num in enumerate(inserted):
+        fn_id = 100 + offset
+        ref_text = refs_dict.get(num, f"[{num}]")
+        # 转义 XML 特殊字符
+        safe_text = ref_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        fn_xml_parts.append(
+            f'  <w:footnote w:id="{fn_id}">'
+            f'<w:p><w:pPr><w:pStyle w:val="FootnoteText"/></w:pPr>'
+            f'<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr>'
+            f'<w:footnoteRef/></w:r>'
+            f'<w:r><w:t xml:space="preserve"> [{num}] {safe_text}</w:t></w:r>'
+            f'</w:p></w:footnote>'
+        )
+    fn_xml_parts.append('</w:footnotes>')
+    fn_xml = "\n".join(fn_xml_parts).encode("utf-8")
+
+    if footnotes_part is None:
+        # 创建新的 footnotes part
+        partname = PackURI("/word/footnotes.xml")
+        content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"
+        footnotes_part = Part(partname, content_type, fn_xml, package)
+        # 添加关系
+        doc.part.relate_to(footnotes_part, RT.FOOTNOTES)
+    else:
+        # 更新已有 part
+        footnotes_part._blob = fn_xml
+
+
 # ============ 6. 按需下载某格式文件 ============
 @app.get("/api/task/{internal_id}/format/{fmt}")
 async def download_format(internal_id: str, fmt: str):
@@ -773,21 +1008,32 @@ async def download_format(internal_id: str, fmt: str):
         resp.raise_for_status()
         zip_bytes = resp.content
 
-    # 在 ZIP 中查找匹配文件
+    # 在 ZIP 中查找匹配文件 + 提取 markdown（用于脚注）
     target_name = None
     target_content = None
+    md_content = ""
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             for name in zf.namelist():
                 if name.endswith(f".{fmt}"):
                     target_name = name.split("/")[-1]
                     target_content = zf.read(name)
-                    break
+                elif name.endswith("full.md") and fmt == "docx":
+                    md_content = zf.read(name).decode("utf-8", errors="replace")
     except Exception as e:
         raise HTTPException(500, f"ZIP 解析失败: {e}")
 
     if target_content is None:
         raise HTTPException(404, f"该任务结果中未包含 .{fmt} 格式（解析时未启用 extra_formats 或 MinerU 未生成）")
+
+    # docx 特殊处理：把 [N] 引用替换为真实 Word 脚注
+    if fmt == "docx" and md_content:
+        references = _extract_refs_from_markdown(md_content)
+        if references:
+            print(f"[download_format] 找到 {len(references)} 条参考文献，开始处理 docx 脚注")
+            target_content = _process_docx_with_footnotes(target_content, references)
+        else:
+            print("[download_format] 未找到参考文献，跳过脚注处理")
 
     media_types = {
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
