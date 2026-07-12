@@ -82,11 +82,12 @@ export interface TocItem {
 
 export interface ParseResult {
   filename: string;
+  title: string;             // 文章标题（用于下载文件名）
   markdown: string;
   files: ResultFile[];
   available_formats: ExtraFormat[];
-  toc: TocItem[];           // 大纲
-  references: string[];     // 参考文献
+  toc: TocItem[];
+  references: string[];
 }
 
 export interface ResultFile {

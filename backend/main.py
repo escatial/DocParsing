@@ -79,12 +79,13 @@ class TaskInfo(BaseModel):
 class ParseResult(BaseModel):
     """解析结果：包含 Markdown、ZIP 中可用的额外格式、大纲、参考文献"""
     filename: str
+    title: str = ""              # 文章标题（用于导出文件名）
     markdown: str
     files: list[dict] = []  # 兼容性字段（保留为空）
     available_formats: list[str] = []  # ZIP 内可用的格式（docx）
     # 从 content_list.json 提取的结构化信息
     toc: list[dict] = []         # 大纲 [{level, text, page?}]
-    references: list[str] = []   # 参考文献列表
+    references: list[str] = []   # 参考文献列表（每条是独立字符串）
 
 
 # ============ 批量解析数据模型 ============
@@ -697,8 +698,12 @@ async def download_result(internal_id: str):
     except Exception as e:
         md_content = md_content or f"[ZIP 解析失败: {e}]"
 
+    # 提取文章标题
+    title = _extract_title_from_markdown(md_content) if md_content else ""
+
     return ParseResult(
         filename=info.get("filename", "result"),
+        title=title,
         markdown=md_content,
         files=[],
         available_formats=available_formats,
@@ -708,10 +713,16 @@ async def download_result(internal_id: str):
 
 
 def _extract_toc_and_refs(items: list) -> tuple[list[dict], list[str]]:
-    """从 MinerU content_list.json 中提取大纲和参考文献（结构化优先）"""
+    """
+    从 MinerU content_list.json 中提取大纲和参考文献。
+    参考文献提取规则：
+      - type == reference / references / bibliography
+      - 或者 text 以 [N] / N. 开头（heuristic fallback）
+    """
     toc: list[dict] = []
     refs: list[str] = []
 
+    # 第一轮：标准 type 匹配
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -724,9 +735,39 @@ def _extract_toc_and_refs(items: list) -> tuple[list[dict], list[str]]:
             continue
 
         if item_type in ("reference", "references", "bibliography"):
-            refs.append(text)
+            if text:
+                refs.append(text)
+
+    # 第二轮：如果 refs 为空但有 [N] 开头的项，按编号拼接
+    if not refs:
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            text = (it.get("text") or "").strip()
+            if re.match(r"^\s*\[?\d+\]?[\.\s]\S", text):
+                refs.append(text)
 
     return toc, refs
+
+
+def _extract_title_from_markdown(md: str) -> str:
+    """从 Markdown 中提取文章标题（第一个 # 标题，去除 # 和空格）"""
+    for line in md.split("\n"):
+        line = line.strip()
+        # 跳过代码块标记
+        if line.startswith("```"):
+            return ""
+        # 第一个 # 一级标题
+        if line.startswith("# "):
+            title = line[2:].strip()
+            # 去除末尾的 # 号或特殊字符
+            title = re.sub(r"\s*#+\s*$", "", title)
+            if title:
+                return title
+        # 兼容：第一个非空非 # 标题行作为标题兜底
+        if line and not line.startswith("#") and not line.startswith("---"):
+            return ""
+    return ""
 
 
 def _extract_toc_from_markdown(md: str) -> list[dict]:
@@ -744,20 +785,84 @@ def _extract_toc_from_markdown(md: str) -> list[dict]:
 
 
 def _extract_refs_from_markdown(md: str) -> list[str]:
-    """兜底：从 Markdown 中提取参考文献段落"""
+    """
+    从 Markdown 中提取参考文献段落（兜底）。
+    支持多种格式：
+    - `[1] xxx` / `[1]. xxx`
+    - `1. xxx` / `1) xxx`
+    - 跨多行条目（自动合并相邻非编号行）
+    """
     refs: list[str] = []
     in_ref_section = False
+
+    # 更宽松的章节标题识别
+    ref_header_pattern = re.compile(
+        r"^#{1,3}\s*(参考文献|References?|Bibliography|引用文献|REFERENCES|参考文\s*献|R\s*E\s*F\s*E\s*R\s*E\s*N\s*C\s*E\s*S)",
+        re.I,
+    )
+    # 编号模式：支持 [1]、[1].、1.、1) 等
+    num_pattern = re.compile(r"^\s*\[?(\d{1,3})\]?[\.\)\s]+(.+)$")
+    # 下一个标题模式
+    next_header_pattern = re.compile(r"^#{1,3}\s+\S")
+
+    current_ref_lines: list[str] = []
+    current_num: int | None = None
+
+    def flush_current():
+        """把累积的多行合并成一条 ref"""
+        nonlocal current_ref_lines, current_num
+        if current_num is not None and current_ref_lines:
+            full = " ".join(s for s in current_ref_lines if s).strip()
+            # 清理多余空格
+            full = re.sub(r"\s+", " ", full)
+            if full:
+                refs.append(full)
+        current_ref_lines = []
+        current_num = None
+
     for line in md.split("\n"):
         stripped = line.strip()
-        # 识别「参考文献」「References」「Bibliography」等章节
-        if re.match(r"^#{1,3}\s*(参考文献|References?|Bibliography|引用文献|REFERENCES)", stripped, re.I):
+
+        # 进入参考文献章节
+        if ref_header_pattern.match(stripped):
             in_ref_section = True
+            flush_current()
             continue
-        # 进入参考文献段后，遇到下一个标题则退出
-        if in_ref_section and re.match(r"^#{1,3}\s+", stripped):
+
+        # 离开参考文献章节（遇到下一个标题）
+        if in_ref_section and next_header_pattern.match(stripped):
+            flush_current()
             in_ref_section = False
-        if in_ref_section and stripped:
-            refs.append(stripped)
+            continue
+
+        if not in_ref_section:
+            continue
+
+        # 跳过空行（不切断条目）
+        if not stripped:
+            if current_num is not None:
+                # 空行：当前条目结束
+                flush_current()
+            continue
+
+        # 尝试匹配新的编号条目
+        m = num_pattern.match(stripped)
+        if m:
+            # 新条目开始：先 flush 上一条
+            flush_current()
+            current_num = int(m.group(1))
+            # 条目正文（去掉编号）
+            body = m.group(2).strip()
+            if body:
+                current_ref_lines.append(body)
+        else:
+            # 非编号行：视为上一条目的延续（跨行条目）
+            if current_num is not None:
+                current_ref_lines.append(stripped)
+
+    # 收尾
+    flush_current()
+
     return refs[:50]  # 最多 50 条防溢出
 
 
@@ -805,10 +910,18 @@ def _process_docx_with_footnotes(docx_bytes: bytes, references: list[str]) -> by
     """
     将 MinerU 生成的 docx 中的 [N] 引用转换为 Word 真实脚注。
 
+    参数:
+        docx_bytes: 原始 docx 二进制（来自 MinerU）
+        references: 参考文献列表，索引即为编号（0 -> [1], 1 -> [2]...）
+                   每项可以是带 `[1]` 前缀的字符串，也可以是纯文本
+
     策略：
-    1. 在 docx 末尾插入 Footnote XML 部件（如果不存在）
-    2. 把每个 [N] 文本替换为 footnoteReference
-    3. 在 footnotes.xml 中添加对应的 footnote 节点
+    1. 把 references 解析成 {num: text} 字典
+       - 如果项含 [N] 前缀，使用 N 作为编号
+       - 否则按列表索引作为编号（1-based）
+    2. 在 docx 末尾插入 Footnote XML 部件
+    3. 把正文中每个 [N] 文本替换为 footnoteReference
+    4. 在 footnotes.xml 中添加对应的 footnote 节点（仅正文文本，不含 [N] 前缀）
     """
     try:
         doc = Document(io.BytesIO(docx_bytes))
@@ -816,17 +929,28 @@ def _process_docx_with_footnotes(docx_bytes: bytes, references: list[str]) -> by
         print(f"[process_docx_footnotes] 打开 docx 失败: {e}")
         return docx_bytes
 
-    # 收集 references 列表（按编号排序）
-    # 如果 references 是 ["[1] xxx", "[2] yyy"]，需要解析成 dict
+    # 收集 references 字典：编号 -> 文本
     refs_dict: dict[int, str] = {}
-    for ref in references:
-        m = re.match(r"^\s*\[?(\d+)\]?[\.\s]*(.+)$", ref.strip())
+    for idx, ref in enumerate(references):
+        ref = ref.strip()
+        if not ref:
+            continue
+        # 如果项带 [N] 前缀，使用 N 作为编号
+        m = re.match(r"^\s*\[?(\d+)\]?[\.\s]*(.+)$", ref)
         if m:
-            refs_dict[int(m.group(1))] = m.group(2).strip()
+            num = int(m.group(1))
+            text = m.group(2).strip()
+        else:
+            # 否则按列表索引（1-based）作为编号
+            num = idx + 1
+            text = ref
+        refs_dict[num] = text
 
     if not refs_dict:
         print("[process_docx_footnotes] 没有可用的参考文献，不处理")
         return docx_bytes
+
+    print(f"[process_docx_footnotes] 解析到 {len(refs_dict)} 条参考文献，编号: {sorted(refs_dict.keys())[:10]}...")
 
     # 1. 扫描文档中所有 [N] 文本
     # python-docx 不直接支持正则替换 paragraph text，我们用 XML 操作
@@ -964,15 +1088,16 @@ def _ensure_footnotes_part(doc, refs_dict: dict[int, str], inserted: list[int]):
     # ID 从 100 开始（与 process_docx 中 fn_id 一致）
     for offset, num in enumerate(inserted):
         fn_id = 100 + offset
-        ref_text = refs_dict.get(num, f"[{num}]")
+        ref_text = refs_dict.get(num, "")
         # 转义 XML 特殊字符
         safe_text = ref_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # Word 脚注会自动渲染编号（上标小数字），所以正文部分只写参考文献文本内容，不需要再加 [N] 前缀
         fn_xml_parts.append(
             f'  <w:footnote w:id="{fn_id}">'
             f'<w:p><w:pPr><w:pStyle w:val="FootnoteText"/></w:pPr>'
             f'<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr>'
             f'<w:footnoteRef/></w:r>'
-            f'<w:r><w:t xml:space="preserve"> [{num}] {safe_text}</w:t></w:r>'
+            f'<w:r><w:t xml:space="preserve"> {safe_text}</w:t></w:r>'
             f'</w:p></w:footnote>'
         )
     fn_xml_parts.append('</w:footnotes>')
@@ -1026,8 +1151,18 @@ async def download_format(internal_id: str, fmt: str):
     if target_content is None:
         raise HTTPException(404, f"该任务结果中未包含 .{fmt} 格式（解析时未启用 extra_formats 或 MinerU 未生成）")
 
-    # docx 特殊处理：把 [N] 引用替换为真实 Word 脚注
+    # docx 特殊处理：把 [N] 引用替换为真实 Word 脚注 + 使用文章标题作为下载文件名
+    download_name = target_name  # 默认用原文件名
     if fmt == "docx" and md_content:
+        # 提取文章标题作为新文件名
+        title = _extract_title_from_markdown(md_content)
+        if title:
+            # 清理标题中的非法字符
+            safe_title = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", title).strip()
+            if safe_title:
+                download_name = f"{safe_title}.docx"
+                print(f"[download_format] 使用文章标题作为文件名: {download_name}")
+
         references = _extract_refs_from_markdown(md_content)
         if references:
             print(f"[download_format] 找到 {len(references)} 条参考文献，开始处理 docx 脚注")
@@ -1045,8 +1180,8 @@ async def download_format(internal_id: str, fmt: str):
         media_type=media_types[fmt],
         headers={
             "Content-Disposition": (
-                f"attachment; filename={target_name}; "
-                f"filename*=UTF-8''{urllib.parse.quote(target_name)}"
+                f"attachment; filename={download_name}; "
+                f"filename*=UTF-8''{urllib.parse.quote(download_name)}"
             )
         },
     )

@@ -752,7 +752,9 @@ export default function App() {
                   <FileText size={16} className="text-blue-600" />
                   Markdown 预览
                   <span className="text-xs text-slate-400 font-normal">
-                    {(currentResult ?? selectedBatchResult)?.filename}
+                    {((currentResult ?? selectedBatchResult)?.title) ||
+                      ((currentResult ?? selectedBatchResult)?.filename) ||
+                      ''}
                   </span>
                 </h2>
                 <div className="flex items-center gap-2">
