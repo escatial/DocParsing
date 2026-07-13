@@ -674,7 +674,7 @@ async def download_result(internal_id: str):
                 for fmt in SUPPORTED_EXTRA_FORMATS:
                     if name.endswith(f".{fmt}") and fmt not in available_formats:
                         available_formats.append(fmt)
-                # content_list.json：MinerU 的结构化输出
+                # content_list.json：MinerU 的结构化输出（仅用于大纲提取，参考文献用 markdown 解析更可靠）
                 if name.endswith("_content_list.json") and content_list_data is None:
                     try:
                         raw = zf.read(name).decode("utf-8", errors="replace")
@@ -682,19 +682,16 @@ async def download_result(internal_id: str):
                     except Exception:
                         content_list_data = None
 
-            # 从 content_list 中提取大纲和参考文献
-            if isinstance(content_list_data, list):
-                toc, references = _extract_toc_and_refs(content_list_data)
-            # 部分 ZIP 用 dict 形式（含 items 字段）
-            elif isinstance(content_list_data, dict):
-                items = content_list_data.get("items") or []
-                toc, references = _extract_toc_and_refs(items)
+            # 优先从 markdown 提取大纲和参考文献（更可靠，能精确定位章节边界）
+            toc = _extract_toc_from_markdown(md_content) if md_content else []
+            references = _extract_refs_from_markdown(md_content) if md_content else []
 
-            # 兜底：如果 content_list 没提取到，从 markdown 解析
-            if not toc and md_content:
-                toc = _extract_toc_from_markdown(md_content)
-            if not references and md_content:
-                references = _extract_refs_from_markdown(md_content)
+            # 如果 markdown 解析失败，再尝试 content_list 兜底（仅作为补充）
+            if not toc and content_list_data is not None:
+                items = content_list_data if isinstance(content_list_data, list) else (
+                    content_list_data.get("items") if isinstance(content_list_data, dict) else []
+                )
+                toc, _ = _extract_toc_and_refs(items)
     except Exception as e:
         md_content = md_content or f"[ZIP 解析失败: {e}]"
 
@@ -786,82 +783,110 @@ def _extract_toc_from_markdown(md: str) -> list[dict]:
 
 def _extract_refs_from_markdown(md: str) -> list[str]:
     """
-    从 Markdown 中提取参考文献段落（兜底）。
-    支持多种格式：
+    从 Markdown 中提取参考文献段落。
+    支持两种情况：
+    1. 标准结构：Markdown 中存在 `## 参考文献` 等章节标题
+    2. 无章节标题：扫描全文独立的编号行条目（不与正文 [N] 引用混在一起）
+
+    编号格式支持：
     - `[1] xxx` / `[1]. xxx`
     - `1. xxx` / `1) xxx`
     - 跨多行条目（自动合并相邻非编号行）
     """
     refs: list[str] = []
-    in_ref_section = False
 
     # 更宽松的章节标题识别
     ref_header_pattern = re.compile(
         r"^#{1,3}\s*(参考文献|References?|Bibliography|引用文献|REFERENCES|参考文\s*献|R\s*E\s*F\s*E\s*R\s*E\s*N\s*C\s*E\s*S)",
         re.I,
     )
-    # 编号模式：支持 [1]、[1].、1.、1) 等
-    num_pattern = re.compile(r"^\s*\[?(\d{1,3})\]?[\.\)\s]+(.+)$")
+    # 编号行模式：以 [N] 或 N. 开头的独立行
+    num_pattern = re.compile(r"^\s*\[(\d{1,3})\][\.\s]*(.+)$")
+    # 普通编号模式：1. xxx 或 1) xxx
+    plain_num_pattern = re.compile(r"^\s*(\d{1,3})[\.\)]\s+(.+)$")
     # 下一个标题模式
     next_header_pattern = re.compile(r"^#{1,3}\s+\S")
 
+    # ============ 阶段 1：尝试定位「参考文献」章节 ============
+    in_ref_section = False
     current_ref_lines: list[str] = []
     current_num: int | None = None
 
-    def flush_current():
+    def flush_current(into_list: list[str]):
         """把累积的多行合并成一条 ref"""
         nonlocal current_ref_lines, current_num
         if current_num is not None and current_ref_lines:
             full = " ".join(s for s in current_ref_lines if s).strip()
-            # 清理多余空格
             full = re.sub(r"\s+", " ", full)
             if full:
-                refs.append(full)
+                into_list.append(full)
         current_ref_lines = []
         current_num = None
 
-    for line in md.split("\n"):
+    lines = md.split("\n")
+    for line in lines:
         stripped = line.strip()
 
-        # 进入参考文献章节
         if ref_header_pattern.match(stripped):
             in_ref_section = True
-            flush_current()
+            flush_current(refs)
             continue
 
-        # 离开参考文献章节（遇到下一个标题）
         if in_ref_section and next_header_pattern.match(stripped):
-            flush_current()
+            flush_current(refs)
             in_ref_section = False
             continue
 
         if not in_ref_section:
             continue
 
-        # 跳过空行（不切断条目）
+        # 章节内：跳过空行（不切断）
         if not stripped:
             if current_num is not None:
-                # 空行：当前条目结束
-                flush_current()
+                flush_current(refs)
             continue
 
-        # 尝试匹配新的编号条目
+        # 匹配 [1] xxx 格式
         m = num_pattern.match(stripped)
+        if not m:
+            m = plain_num_pattern.match(stripped)
         if m:
-            # 新条目开始：先 flush 上一条
-            flush_current()
+            flush_current(refs)
             current_num = int(m.group(1))
-            # 条目正文（去掉编号）
             body = m.group(2).strip()
             if body:
                 current_ref_lines.append(body)
         else:
-            # 非编号行：视为上一条目的延续（跨行条目）
+            # 非编号行视为上一条目延续
             if current_num is not None:
                 current_ref_lines.append(stripped)
 
-    # 收尾
-    flush_current()
+    flush_current(refs)
+
+    # ============ 阶段 2：如果章节法没找到，扫描全文独立编号条目 ============
+    if not refs:
+        # 收集文档中所有 [N] 引用（正文中）和独立的 [N] xxx 编号行
+        # 启发式：匹配以 [N] 开头的非引用行（长度 > 30 字符或包含期刊标记）
+        candidate_pattern = re.compile(r"^\s*\[(\d{1,3})\][\s\.]*(.{20,})$")
+        seen_nums: set[int] = set()
+        for line in lines:
+            stripped = line.strip()
+            # 跳过标题章节
+            if stripped.startswith("#"):
+                continue
+            m = candidate_pattern.match(stripped)
+            if m:
+                num = int(m.group(1))
+                content = m.group(2).strip()
+                # 排除明显的正文引用（短文本 + 通常以"，"、"。" 结尾的引文）
+                # 启发规则：参考文献通常比较长，包含期刊标记 [J] / [M] / [C] 或出版社信息
+                is_likely_ref = (
+                    len(content) > 20
+                    or bool(re.search(r"\[\w\]|\(\d{4}\)|\d{4}\s*年|\d+\(\d+\)|et al\.|出版社|Univ", content))
+                )
+                if is_likely_ref and num not in seen_nums:
+                    refs.append(content)
+                    seen_nums.add(num)
 
     return refs[:50]  # 最多 50 条防溢出
 
