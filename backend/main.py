@@ -873,8 +873,12 @@ def _looks_like_academic_title(line: str) -> bool:
 def _clean_title(t: str) -> str:
     """清理标题：去掉装饰字符"""
     t = re.sub(r"[*_`]+", "", t)
-    t = re.sub(r"^\s*[【《「]", "", t)
-    t = re.sub(r"[】》」]\s*$", "", t)
+    # 中文括号
+    t = re.sub(r"^[【《「]\s*", "", t)
+    t = re.sub(r"\s*[】》」]$", "", t)
+    # ASCII 方括号（只在标题首尾存在时去掉）
+    t = re.sub(r"^\s*\[\s*", "", t)
+    t = re.sub(r"\s*\]\s*$", "", t)
     return t.strip()
 
 

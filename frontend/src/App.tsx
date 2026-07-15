@@ -22,6 +22,9 @@ import {
   Plus,
   X,
   ListChecks,
+  ScanSearch,
+  Brain,
+  Package,
 } from 'lucide-react';
 import {
   submitParse,
@@ -62,38 +65,10 @@ const SUB_STAGE_LIST: {
   icon: typeof Cpu;
 }[] = [
   { id: 'queued', label: '排队等待', desc: 'MinerU 调度资源中', icon: Cpu },
-  { id: 'parsing_page', label: '页面解析', desc: 'OCR / 版面分析 / 切分', icon: ScanSearchInline },
-  { id: 'inferencing', label: '模型推理', desc: 'VLM/Pipeline 模型分析', icon: BrainInline },
-  { id: 'assembling', label: '结果组装', desc: '拼接 Markdown / 转换格式', icon: PackageInline },
+  { id: 'parsing_page', label: '页面解析', desc: 'OCR / 版面分析 / 切分', icon: ScanSearch },
+  { id: 'inferencing', label: '模型推理', desc: 'VLM/Pipeline 模型分析', icon: Brain },
+  { id: 'assembling', label: '结果组装', desc: '拼接 Markdown / 转换格式', icon: Package },
 ];
-
-// 子阶段图标（inline 临时组件，避免循环引用）
-function ScanSearchInline(props: { size?: number; className?: string }) {
-  return (
-    <svg width={props.size ?? 14} height={props.size ?? 14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={props.className}>
-      <path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2" />
-      <line x1="3" y1="12" x2="21" y2="12" />
-    </svg>
-  );
-}
-function BrainInline(props: { size?: number; className?: string }) {
-  return (
-    <svg width={props.size ?? 14} height={props.size ?? 14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={props.className}>
-      <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z" />
-      <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z" />
-    </svg>
-  );
-}
-function PackageInline(props: { size?: number; className?: string }) {
-  return (
-    <svg width={props.size ?? 14} height={props.size ?? 14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={props.className}>
-      <path d="M16.5 9.4 7.55 4.24" />
-      <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" />
-      <path d="m3.27 6.96 8.73 5.04 8.73-5.04" />
-      <path d="M12 22.08V12" />
-    </svg>
-  );
-}
 
 const MAX_BATCH_FILES = 10;
 
