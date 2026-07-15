@@ -833,9 +833,13 @@ def _extract_title_from_markdown(md: str) -> str:
         # 截取到第一个标点（标题通常到第一个句号或冒号前）
         # 但中文标题没有句号，所以只截取到合理长度
         if 4 <= len(joined) <= 150:
-            return joined
+            # 排除纯装饰字符（纯 #、*、= 等）
+            if re.search(r"[一-龥A-Za-z0-9]", joined):
+                return joined
         # 太长：截取前 60 字符
-        return joined[:60].strip()
+        candidate = joined[:60].strip()
+        if 4 <= len(candidate) <= 150 and re.search(r"[一-龥A-Za-z0-9]", candidate):
+            return candidate
 
     return ""
 
@@ -863,10 +867,15 @@ def _looks_like_academic_title(line: str) -> bool:
         r"\d{4}\s*年",             # 2020 年
         r"DOI[:：]",
         r"^第\s*\d+\s*[卷期章]",
+        r"^#+$",                   # 纯 # 装饰
+        r"^[*_~=]+$",              # 纯 * _ ~ = 装饰
     ]
     for p in exclude_patterns:
         if re.search(p, line, re.I):
             return False
+    # 必须包含字母或中文（不然全是标点）
+    if not re.search(r"[一-龥A-Za-z]", line):
+        return False
     return True
 
 
@@ -894,6 +903,9 @@ def _is_valid_title(t: str) -> bool:
     if t.startswith("|") or t.endswith("|"):  # 表格
         return False
     if t.startswith("- ") or t.startswith("* ") or t.startswith("> "):
+        return False
+    # 全是标点或装饰字符（#、*、~、=、-、_）
+    if re.fullmatch(r"[\s#*_~=~\-]+", t):
         return False
     return True
 

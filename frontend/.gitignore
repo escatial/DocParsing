@@ -39,6 +39,7 @@ build
 .eslintcache
 .parcel-cache
 .vite
+*.tsbuildinfo
 
 # Coverage
 coverage
