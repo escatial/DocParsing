@@ -748,23 +748,150 @@ def _extract_toc_and_refs(items: list) -> tuple[list[dict], list[str]]:
 
 
 def _extract_title_from_markdown(md: str) -> str:
-    """从 Markdown 中提取文章标题（第一个 # 标题，去除 # 和空格）"""
-    for line in md.split("\n"):
+    """
+    从 Markdown 中提取文章标题（多策略，按优先级尝试）:
+    1. YAML frontmatter 中的 title 字段
+    2. 第一个 `# 一级标题`
+    3. 第一个 `## 二级标题`
+    4. "Title: xxx" / "题目：" / "标题：" 等显式标记
+    5. 文档首段（首段连续非空行）
+    6. Markdown 第一行非空文本（兜底）
+
+    长度限制 4-150 字符，排除表格行、列表项、URL、邮箱等。
+    """
+    if not md:
+        return ""
+
+    lines = md.split("\n")
+
+    # 策略 1：YAML frontmatter
+    if lines and lines[0].strip() == "---":
+        for i in range(1, min(20, len(lines))):
+            if lines[i].strip() == "---":
+                break
+            m = re.match(r"^\s*title:\s*(.+)$", lines[i])
+            if m:
+                t = m.group(1).strip().strip("'\"")
+                if _is_valid_title(t):
+                    return t
+
+    # 策略 2：第一个 # 一级标题
+    for line in lines:
         line = line.strip()
-        # 跳过代码块标记
-        if line.startswith("```"):
-            return ""
-        # 第一个 # 一级标题
+        if not line or line.startswith("```"):
+            continue
         if line.startswith("# "):
             title = line[2:].strip()
-            # 去除末尾的 # 号或特殊字符
             title = re.sub(r"\s*#+\s*$", "", title)
-            if title:
+            title = re.sub(r"[*_`]+", "", title)
+            if _is_valid_title(title):
                 return title
-        # 兼容：第一个非空非 # 标题行作为标题兜底
-        if line and not line.startswith("#") and not line.startswith("---"):
-            return ""
+            continue
+
+    # 策略 3：第一个 ## 二级标题（仅当文档不含一级标题时）
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("```"):
+            continue
+        if line.startswith("## "):
+            title = line[3:].strip()
+            title = re.sub(r"\s*#+\s*$", "", title)
+            title = re.sub(r"[*_`]+", "", title)
+            if _is_valid_title(title):
+                return title
+            continue
+
+    # 策略 4：显式标题标记
+    title_marker = re.compile(
+        r"^(?:Title|题目|标题|题\s*目|Title\s*[:：])\s*[:：]?\s*(.+)$",
+        re.I,
+    )
+    for line in lines[:30]:
+        m = title_marker.match(line.strip())
+        if m:
+            t = m.group(1).strip().strip("'\"").strip()
+            if _is_valid_title(t):
+                return t
+
+    # 策略 5：文档首段（连续非空行合并）
+    # 这处理学术论文常把标题放在前面几行不间断段落中的情况
+    first_block_lines: list[str] = []
+    for line in lines[:20]:
+        stripped = line.strip()
+        if not stripped:
+            break  # 空行 = 段落结束
+        first_block_lines.append(stripped)
+
+    # 优先：只取首段中**第一个**像标题的行（避免取到摘要或作者）
+    for line in first_block_lines[:3]:
+        if _looks_like_academic_title(line):
+            return _clean_title(line)
+
+    # 兜底：首段合并
+    if first_block_lines:
+        joined = " ".join(first_block_lines).strip()
+        # 截取到第一个标点（标题通常到第一个句号或冒号前）
+        # 但中文标题没有句号，所以只截取到合理长度
+        if 4 <= len(joined) <= 150:
+            return joined
+        # 太长：截取前 60 字符
+        return joined[:60].strip()
+
     return ""
+
+
+def _looks_like_academic_title(line: str) -> bool:
+    """
+    判断一行是否像学术论文标题。
+    特征：
+    - 中等长度（10-100 字符）
+    - 不包含明显的元数据标记（@, 网址, DOI, 作者后跟逗号+年份）
+    - 通常是中文/英文的短语（不含段末句号后的多余内容）
+    """
+    line = line.strip()
+    if not (8 <= len(line) <= 100):
+        return False
+    # 排除明显不是标题的内容
+    exclude_patterns = [
+        r"^摘\s*要",            # 摘要
+        r"^Abstract",            # Abstract
+        r"^关键词",               # 关键词
+        r"^Keywords",             # Keywords
+        r"^作者",                  # 作者
+        r"@\w",                    # 邮箱
+        r"https?://",              # URL
+        r"\d{4}\s*年",             # 2020 年
+        r"DOI[:：]",
+        r"^第\s*\d+\s*[卷期章]",
+    ]
+    for p in exclude_patterns:
+        if re.search(p, line, re.I):
+            return False
+    return True
+
+
+def _clean_title(t: str) -> str:
+    """清理标题：去掉装饰字符"""
+    t = re.sub(r"[*_`]+", "", t)
+    t = re.sub(r"^\s*[【《「]", "", t)
+    t = re.sub(r"[】》」]\s*$", "", t)
+    return t.strip()
+
+
+def _is_valid_title(t: str) -> bool:
+    """判断字符串是否像标题"""
+    if not t:
+        return False
+    t = t.strip()
+    # 太长或太短都不是
+    if len(t) < 4 or len(t) > 150:
+        return False
+    # 排除明显不是标题的内容
+    if t.startswith("|") or t.endswith("|"):  # 表格
+        return False
+    if t.startswith("- ") or t.startswith("* ") or t.startswith("> "):
+        return False
+    return True
 
 
 def _extract_toc_from_markdown(md: str) -> list[dict]:
@@ -1177,16 +1304,33 @@ async def download_format(internal_id: str, fmt: str):
         raise HTTPException(404, f"该任务结果中未包含 .{fmt} 格式（解析时未启用 extra_formats 或 MinerU 未生成）")
 
     # docx 特殊处理：把 [N] 引用替换为真实 Word 脚注 + 使用文章标题作为下载文件名
-    download_name = target_name  # 默认用原文件名
+    download_name = target_name  # 默认 = full.docx
     if fmt == "docx" and md_content:
-        # 提取文章标题作为新文件名
+        # 策略 1：提取文章标题
         title = _extract_title_from_markdown(md_content)
         if title:
-            # 清理标题中的非法字符
             safe_title = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", title).strip()
             if safe_title:
                 download_name = f"{safe_title}.docx"
                 print(f"[download_format] 使用文章标题作为文件名: {download_name}")
+
+        # 策略 2：标题提取失败 → 用原 PDF 文件名（去扩展名 + 清理）
+        if download_name == target_name and info.get("filename"):
+            original_name = re.sub(r'\.[^.]+$', '', info["filename"])  # 去扩展名
+            # 清理：把分隔符替换成空格（如 "_夏后学" → " 夏后学"）
+            original_name = re.sub(r'[_\-]+', ' ', original_name).strip()
+            # 去掉首尾的英文括号内容（如 "(2024)"）
+            original_name = re.sub(r'\(\d{4}\)', '', original_name).strip()
+            if original_name:
+                download_name = f"{original_name}.docx"
+                print(f"[download_format] 标题提取失败，用原文件名: {download_name}")
+
+        # 策略 3：兜底 → 用生成的 internal_id 前 8 位
+        if download_name == target_name:
+            import uuid
+            short_id = str(uuid.uuid4())[:8]
+            download_name = f"document_{short_id}.docx"
+            print(f"[download_format] 完全兜底: {download_name}")
 
         references = _extract_refs_from_markdown(md_content)
         if references:
