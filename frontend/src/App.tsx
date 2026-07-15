@@ -375,7 +375,8 @@ export default function App() {
     return r?.references ?? [];
   }, [currentResult, selectedBatchResult]);
 
-  const hasDocx = (currentResult?.available_formats ?? []).includes('docx');
+  const activeResult = currentResult ?? selectedBatchResult;
+  const hasDocx = (activeResult?.available_formats ?? []).includes('docx');
 
   // 单文件进度
   const singleProgressPct =

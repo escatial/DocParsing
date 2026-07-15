@@ -1351,21 +1351,25 @@ async def download_format(internal_id: str, fmt: str):
         references = _extract_refs_from_markdown(md_content)
         if references:
             print(f"[download_format] 找到 {len(references)} 条参考文献，开始处理 docx 脚注")
-            target_content = _process_docx_with_footnotes(target_content, references)
+            try:
+                target_content = _process_docx_with_footnotes(target_content, references)
+            except Exception as e:
+                print(f"[download_format] docx 脚注处理失败，返回原始 docx: {e}")
         else:
             print("[download_format] 未找到参考文献，跳过脚注处理")
 
     media_types = {
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "html": "text/html",
-        "latex": "application/x-latex",
     }
+    ascii_fallback = re.sub(r"[^A-Za-z0-9_.-]+", "_", download_name).strip("_")
+    if not ascii_fallback or ascii_fallback in (".docx", "docx"):
+        ascii_fallback = "document.docx"
     return StreamingResponse(
         io.BytesIO(target_content),
         media_type=media_types[fmt],
         headers={
             "Content-Disposition": (
-                f"attachment; filename={download_name}; "
+                f'attachment; filename="{ascii_fallback}"; '
                 f"filename*=UTF-8''{urllib.parse.quote(download_name)}"
             )
         },
