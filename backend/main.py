@@ -191,6 +191,39 @@ async def upload_and_submit(
         return batch_id
 
 
+async def submit_single_in_background(
+    internal_id: str,
+    content: bytes,
+    filename: str,
+    model_version: str,
+    is_ocr: bool,
+    enable_formula: bool,
+    enable_table: bool,
+):
+    """后台提交单文件到 MinerU，避免前端卡在 /api/parse 请求上"""
+    info = TASKS.get(internal_id)
+    if not info or info.get("cancelled"):
+        return
+    try:
+        batch_id = await upload_and_submit(
+            content,
+            filename or "document.pdf",
+            model_version,
+            is_ocr,
+            enable_formula,
+            enable_table,
+            ["docx"],
+        )
+        info["task_id"] = batch_id
+        info["state"] = "pending"
+        info["err_msg"] = ""
+        print(f"[submit_single_in_background] MinerU batch_id: {batch_id}")
+    except Exception as e:
+        print(f"[submit_single_in_background] MinerU 调用失败: {type(e).__name__}: {e}")
+        info["state"] = "failed"
+        info["err_msg"] = f"MinerU 调用失败: {e}"
+
+
 @app.post("/api/parse")
 async def parse_document(
     background: BackgroundTasks,
@@ -211,24 +244,10 @@ async def parse_document(
     if not content:
         raise HTTPException(400, "空文件")
 
-    # 提交到 MinerU，默认请求 docx/html/latex 格式
-    try:
-        batch_id = await upload_and_submit(
-            content, file.filename or "document.pdf", model_version,
-            is_ocr, enable_formula, enable_table,
-            ["docx"],
-        )
-        print(f"[parse_document] MinerU batch_id: {batch_id}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[parse_document] MinerU 调用失败: {type(e).__name__}: {e}")
-        raise HTTPException(500, f"MinerU 调用失败: {e}")
-
-    # 记录到本地任务表
+    # 先记录到本地任务表并立即返回，MinerU 上传放到后台执行，避免前端卡在“上传文件”
     internal_id = str(uuid.uuid4())
     TASKS[internal_id] = {
-        "task_id": batch_id,
+        "task_id": "",
         "state": "pending",
         "extracted_pages": 0,
         "total_pages": 0,
@@ -237,8 +256,19 @@ async def parse_document(
         "model_version": model_version,
         "filename": file.filename,
         "created_at": time.time(),
+        "extra_formats": ["docx"],
     }
-    return {"internal_id": internal_id, "batch_id": batch_id}
+    background.add_task(
+        submit_single_in_background,
+        internal_id,
+        content,
+        file.filename or "document.pdf",
+        model_version,
+        is_ocr,
+        enable_formula,
+        enable_table,
+    )
+    return {"internal_id": internal_id, "batch_id": ""}
 
 
 # ============ 1.5 批量上传并解析（1-10 个文件） ============
@@ -402,6 +432,20 @@ async def get_task(internal_id: str):
             model_version="vlm",
             extra_formats=[],
             sub_stage="queued",
+        )
+
+    # 后台尚未拿到 MinerU batch_id：保持 pending，不阻塞前端
+    if not info.get("task_id"):
+        return TaskInfo(
+            task_id="",
+            state=info.get("state", "pending"),
+            extracted_pages=info.get("extracted_pages", 0),
+            total_pages=info.get("total_pages", 0),
+            full_zip_url=info.get("full_zip_url"),
+            err_msg=info.get("err_msg") or "正在上传到 MinerU，请稍候",
+            model_version=info.get("model_version", "vlm"),
+            extra_formats=info.get("extra_formats", ["docx"]),
+            sub_stage=infer_sub_stage(info.get("state", "pending"), 0, 0),
         )
 
     # 已取消的任务：直接返回 cancelled，不再轮询 MinerU
