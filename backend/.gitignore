@@ -38,3 +38,11 @@ htmlcov/
 
 # mypy
 .mypy_cache/
+
+# 临时调试脚本（IDE 编辑过程中可能产生的）
+_*.py
+_*debug*.py
+_*test*.py
+
+# MinerU 调试输出
+_mineru_debug/
