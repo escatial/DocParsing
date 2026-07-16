@@ -1748,23 +1748,37 @@ async def download_format(internal_id: str, fmt: str):
     target_name = None
     target_content = None
     md_content = ""
+    md_name = ""
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             for name in zf.namelist():
                 if name.endswith(f".{fmt}"):
                     target_name = name.split("/")[-1]
                     target_content = zf.read(name)
-                elif name.endswith("full.md") and fmt == "docx":
-                    md_content = zf.read(name).decode("utf-8", errors="replace")
+                elif fmt == "docx" and not md_content:
+                    # MinerU 输出的 markdown 文件名不一定是 full.md；取第一个 .md
+                    if name.endswith("full.md") or (name.endswith(".md") and "/auto/" not in name and "/layout/" not in name):
+                        md_name = name
+                        md_content = zf.read(name).decode("utf-8", errors="replace")
+        if fmt == "docx" and not md_content:
+            # 兜底：找任意 .md
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                for name in zf.namelist():
+                    if name.endswith(".md"):
+                        print(f"[download_format] 警告: 未找到 full.md，使用 {name} 作为 markdown 来源")
+                        md_content = zf.read(name).decode("utf-8", errors="replace")
+                        md_name = name
+                        break
     except Exception as e:
         raise HTTPException(500, f"ZIP 解析失败: {e}")
+    print(f"[download_format] ZIP 解析完成, target_name={target_name}, md_name={md_name or '(none)'}")
 
     if target_content is None:
         raise HTTPException(404, f"该任务结果中未包含 .{fmt} 格式（解析时未启用 extra_formats 或 MinerU 未生成）")
 
     # docx 特殊处理：把 [N] 引用替换为真实 Word 脚注 + 使用文章标题作为下载文件名
     download_name = target_name  # 默认 = full.docx
-    if fmt == "docx" and md_content:
+    if fmt == "docx":
         # 策略 1：提取文章标题
         title = _extract_title_from_markdown(md_content)
         if title:
@@ -1792,8 +1806,14 @@ async def download_format(internal_id: str, fmt: str):
             print(f"[download_format] 完全兜底: {download_name}")
 
         references = _extract_refs_from_markdown(md_content)
+        print(f"[download_format] md_content 长度: {len(md_content)} | 解析到参考文献: {len(references)} 条")
+        if md_content:
+            # 取 md_content 前 300 字符以便诊断
+            md_preview = md_content[:300].replace("\n", " ")
+            print(f"[download_format] md_preview: {md_preview!r}")
         if references:
             print(f"[download_format] 找到 {len(references)} 条参考文献，开始处理 docx 脚注")
+            print(f"[download_format] 前 3 条参考文献: {references[:3]}")
             try:
                 style = _detect_citation_style(md_content)
                 print(f"[download_format] 引用风格: {style}")
@@ -1804,11 +1824,20 @@ async def download_format(internal_id: str, fmt: str):
                         target_content, md_content, references
                     )
                 else:
-                    print("[download_format] 未识别为有效引用模式，跳过脚注处理")
+                    # 兜底：如果有 [N] 形式的引用但 md 中看不到 references 头部，仍尝试数字脚注
+                    print("[download_format] 风格未识别，尝试以数字脚注兜底")
+                    target_content = _process_docx_with_footnotes(target_content, references)
             except Exception as e:
                 print(f"[download_format] docx 脚注处理失败，返回原始 docx: {e}")
+        elif md_content:
+            # 没找到 references 但 md_content 存在 → 看看是否有 [N] 脚注
+            if re.search(r"\[\d+\]", md_content):
+                print("[download_format] md 有 [N] 但未提取到 references，尝试空脚注处理")
+                target_content = _process_docx_with_footnotes(target_content, [])
+            else:
+                print("[download_format] 未找到参考文献，跳过脚注处理")
         else:
-            print("[download_format] 未找到参考文献，跳过脚注处理")
+            print("[download_format] 未找到 md_content 也未找到参考文献，跳过脚注处理")
 
     media_types = {
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
