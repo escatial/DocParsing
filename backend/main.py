@@ -1332,6 +1332,400 @@ def _ensure_footnotes_part(doc, refs_dict: dict[int, str], inserted: list[int]):
         footnotes_part._blob = fn_xml
 
 
+# ============ 作者-年份引用模式所需的辅助函数 ============
+
+def _extract_year_from_ref(ref: str) -> str | None:
+    """从一条参考文献文本中提取年份（4 位数字 + 可选 abcd 后缀）。"""
+    m = re.search(r"\d{4}[a-z]?", ref)
+    return m.group(0) if m else None
+
+
+def _extract_first_author_from_ref(ref: str) -> str | None:
+    """
+    从一条参考文献文本中提取首位作者「姓氏」：
+    - 去掉前导 [N] / N. / N） / 编号点
+    - 中文：取开头连续 2-5 个汉字（去掉末尾的「等」）
+    - 英文：从最近年份左侧的段里取最后一个完整 token 作为姓
+    返回规范化字符串（小写，去前后空格）。
+    """
+    if not ref:
+        return None
+    # 步骤 1: 去掉前导编号
+    text = re.sub(r"^\s*\[?\s*\d+\s*\]?\s*[.,、)\s]*", "", ref).strip()
+    if not text:
+        return None
+    # 步骤 2: 找到首个 4 位年份 出现位置，取年份前为作者段
+    year_match = re.search(r"\d{4}[a-z]?", text)
+    before_year = text[: year_match.start()] if year_match else text
+    author_part = re.split(
+        r"[,;；]|et\s+al\.?|and\s+",
+        before_year,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip().rstrip(".,;:").strip()
+    if not author_part:
+        return None
+    # 步骤 3: 中文：取开头连续 2-5 个汉字（去掉末尾「等」字）
+    cn = re.match(r"[\u4e00-\u9fff]{2,5}(等)?", author_part)
+    if cn:
+        return cn.group(0).rstrip("等").lower()
+    # 步骤 4: 英文：取最后一个合适长度 token 作为姓
+    parts = author_part.split()
+    if not parts:
+        return None
+    last = parts[-1].rstrip(".,;:")
+    if len(last) <= 1 and len(parts) >= 2:
+        last = parts[-2].rstrip(".,;:")
+    return last.lower() if last else None
+
+
+def _build_author_year_index(refs: list[str]) -> dict[tuple[str, str], str]:
+    """
+    由参考文献列表构建索引：{(author, year): ref_text}
+    - 同一作者同年多篇用 2024a/2024b 区分
+    - 同 key 仅保留首次出现的条目
+    """
+    index: dict[tuple[str, str], str] = {}
+    for ref in refs:
+        author = _extract_first_author_from_ref(ref)
+        year = _extract_year_from_ref(ref)
+        if not author or not year:
+            continue
+        key = (author, year)
+        if key not in index:
+            index[key] = ref.strip()
+    return index
+
+
+def _scan_author_year_in_md(
+    md: str, index: dict[tuple[str, str], str]
+) -> list[dict]:
+    """
+    在 md 中查找所有作者-年份引用，按 (author, year) 反向搜索，
+    同时把多文献并列按 年份/分号 拆分为多段。
+
+    返回: [{"start": int, "end": int, "ref_text": str}, ...]
+    按 start 升序排列。
+    """
+    if not md or not index:
+        return []
+    out: list[dict] = []
+    # 索引条目按年份长度降序（"2024b" 优先于 "2024"）以避免误覆盖
+    sorted_index = sorted(index.items(), key=lambda kv: len(kv[0][1]), reverse=True)
+    for (author, year), ref_text in sorted_index:
+        # 转义作者名，author 可能是 unicode 字符
+        author_pat = re.escape(author)
+        # 年份允许 abcd 后缀
+        year_pat = re.escape(year)
+        # 分两段匹配以避免 re.IGNORECASE + 中文字符 兼容性 bug：
+        # 1) 带「等」或「et al.」
+        pat_with_etal = re.compile(
+            rf"({author_pat}\s*(等|et\s*al\.?)\s*[,\uff0c]?\s*{year_pat})",
+            flags=re.IGNORECASE,
+        )
+        # 2) 不带 「等」/「et al.」（仅作者 + 可选分隔符 + 年份）
+        pat_simple = re.compile(
+            rf"({author_pat}\s*[,\uff0c]?\s*{year_pat})",
+            flags=re.IGNORECASE,
+        )
+        for m in pat_with_etal.finditer(md):
+            out.append({
+                "start": m.start(),
+                "end": m.end(),
+                "author": author,
+                "year": year,
+                "ref_text": ref_text,
+            })
+        for m in pat_simple.finditer(md):
+            # 跳过已被 pat_with_etal 覆盖的位置
+            if any(o["start"] == m.start() and o["end"] == m.end() for o in out):
+                continue
+            out.append({
+                "start": m.start(),
+                "end": m.end(),
+                "author": author,
+                "year": year,
+                "ref_text": ref_text,
+            })
+    # 按 start 升序，end 降序排序，剔除重叠
+    out.sort(key=lambda x: (x["start"], -x["end"]))
+    pruned: list[dict] = []
+    last_end = -1
+    for item in out:
+        if item["start"] >= last_end:
+            pruned.append(item)
+            last_end = item["end"]
+    return pruned
+
+
+def _detect_citation_style(md: str) -> str:
+    """
+    探测引用风格：
+    - 'numeric'    正文中有 [N] 形式
+    - 'author_year' 正文中有形如 (作者, 年份) 且文献列表含作者-年份
+    - 'none'       都不匹配
+    """
+    if not md:
+        return "none"
+    if re.search(r"\[\s*\d+\s*\]", md):
+        return "numeric"
+    if re.search(
+        r"[\uff08\(]?\s*[\u4e00-\u9fff\w][\u4e00-\u9fff\w\.,\s]{0,30}?"
+        r"(?:等|et\s*al\.?)?\s*[,\uff0c]\s*\d{4}[a-z]?",
+        md,
+        flags=re.I,
+    ):
+        return "author_year"
+    return "none"
+
+
+def _split_multi_refs(bracket_content: str) -> list[str]:
+    """
+    把多文献并列拆分为多个段：
+    - 优先按 `;` / `；` 分
+    - 然后按 `, author, year` 模式二次拆分（按年份作为分隔点）
+    """
+    if not bracket_content:
+        return []
+    # 按 ; 或 ； 先拆
+    segs = re.split(r"[;；]", bracket_content)
+    out: list[str] = []
+    for seg in segs:
+        seg = seg.strip()
+        if not seg:
+            continue
+        # 按年份作为分隔点再次拆：多个年份 = 多段
+        year_positions = [m.start() for m in re.finditer(r"\d{4}[a-z]?", seg)]
+        if len(year_positions) >= 2:
+            # 从年份左侧扫描，每年一段
+            for i, pos in enumerate(year_positions):
+                # 这段从上一段结束或段首到当前年份末尾
+                if i == 0:
+                    seg_part = seg[: pos + 5]  # 年份 4 位 + 1 后缀
+                else:
+                    seg_part = seg[year_positions[i - 1] + 5 : pos + 5]
+                out.append(seg_part.strip())
+        else:
+            out.append(seg)
+    return out
+
+
+def _process_docx_with_author_year_footnotes(
+    docx_bytes: bytes,
+    md_content: str,
+    references: list[str],
+) -> bytes:
+    """
+    将 docx 中 (作者等, 年份) 形式的引用替换为 Word 真实脚注。
+    复用 footnotes.xml 生成机制（上标、垂直对齐）。
+    多文献并列按 ; 或 年份位置分割。
+    对未被引用的文献条目，在脚注末尾自动生成「提示型」脚注。
+    """
+    try:
+        doc = Document(io.BytesIO(docx_bytes))
+    except Exception as e:
+        print(f"[process_docx_author_year_footnotes] 打开 docx 失败: {e}")
+        return docx_bytes
+
+    index = _build_author_year_index(references)
+    if not index:
+        print("[process_docx_author_year_footnotes] 无法从参考文献构建索引，跳过")
+        return docx_bytes
+
+    # 扫描 markdown 中所有作者-年份引用，按 (author, year) 索引匹配
+    occurrences = _scan_author_year_in_md(md_content, index)
+    if not occurrences:
+        print("[process_docx_author_year_footnotes] markdown 中未匹配到作者-年份引用")
+        return docx_bytes
+
+    # 实际生效的 ref 文本集合（用于判断孤儿文献）
+    used_refs: set[str] = set()
+    for item in occurrences:
+        used_refs.add(item["ref_text"])
+
+    # 实际处理的序号（用于按出现顺序编号）：1, 2, 3 ...
+    # 同一个 ref_text 出现多次，每次都插一个独立脚注（用户要求重复插入跳转）
+    footnote_to_text: list[str] = []
+    for item in occurrences:
+        footnote_to_text.append(item["ref_text"])
+
+    # 加孤儿文献（参考文献里没在正文出现的）作为「提示型脚注」附录
+    orphan_refs: list[str] = []
+    for ref in references:
+        ref_norm = ref.strip()
+        if ref_norm and ref_norm not in used_refs:
+            orphan_refs.append(f"[未在正文中引用] {ref_norm}")
+
+    print(
+        f"[process_docx_author_year_footnotes] 正文中匹配到 {len(footnote_to_text)} 处脚注"
+        f"（含 {len(set(footnote_to_text))} 条独立文献），孤儿文献 {len(orphan_refs)} 条"
+    )
+
+    # 1. 用 markdown 中的位置信息构建需要在 docx 中查找的模式
+    #    docx 是从 MinerU 解析生成的正文字段未必和 markdown 完全一致
+    #    简化策略：在每个段落中分别用每个 (author, year) 模式查找
+    fn_id = 100
+    inserted_idx: list[int] = []  # 已插入的 footnote_to_text 索引
+
+    body = doc.element.body
+    for p in body.iter(qn("w:p")):
+        # 收集段落所有 w:r/w:t 节点
+        runs_with_text: list[tuple] = []
+        for r in p.findall(qn("w:r")):
+            for t in r.findall(qn("w:t")):
+                runs_with_text.append((r, t, t.text or ""))
+        if not runs_with_text:
+            continue
+
+        for r, t, txt in runs_with_text:
+            new_text = txt
+            # 收集该 w:t 中所有 (author, year) 模式的位置（一次扫描所有 key）
+            insertions: list[tuple[int, int, str]] = []
+            for key, ref_text in index.items():
+                author, year = key
+                author_pat = re.escape(author)
+                year_pat = re.escape(year)
+                # 分两段以避免 re.I + (?:...) 组合在某些中文场景的 bug
+                pat_with_etal = re.compile(
+                    rf"({author_pat}\s*(等|et\s*al\.?)\s*[,\uff0c]?\s*{year_pat})",
+                    flags=re.IGNORECASE,
+                )
+                pat_simple = re.compile(
+                    rf"({author_pat}\s*[,\uff0c]?\s*{year_pat})",
+                    flags=re.IGNORECASE,
+                )
+                for sm in pat_with_etal.finditer(new_text):
+                    insertions.append((sm.start(), sm.end(), ref_text))
+                for sm in pat_simple.finditer(new_text):
+                    if not any(s[0] == sm.start() and s[1] == sm.end() for s in insertions):
+                        insertions.append((sm.start(), sm.end(), ref_text))
+            if not insertions:
+                continue
+
+            # 按位置排序，剔除重叠（保留更长的匹配）
+            insertions.sort(key=lambda x: (x[0], -x[1]))
+            pruned: list[tuple[int, int, str]] = []
+            last_end = -1
+            for ins in insertions:
+                if ins[0] >= last_end:
+                    pruned.append(ins)
+                    last_end = ins[1]
+            if not pruned:
+                continue
+
+            # 重建段落
+            parent_run = t.getparent()
+            parent_para = parent_run.getparent()
+            run_index = list(parent_para).index(parent_run)
+
+            rebuilt_runs: list = []
+            cursor = 0
+            for ins_start, ins_end, ins_ref_text in pruned:
+                if cursor < ins_start:
+                    seg_run = OxmlElement("w:r")
+                    seg_t = OxmlElement("w:t")
+                    seg_t.text = new_text[cursor:ins_start]
+                    seg_t.set(qn("xml:space"), "preserve")
+                    seg_run.append(seg_t)
+                    rebuilt_runs.append(seg_run)
+                # 脚注引用 run
+                fn_run = OxmlElement("w:r")
+                rpr = OxmlElement("w:rPr")
+                rstyle = OxmlElement("w:rStyle")
+                rstyle.set(qn("w:val"), "FootnoteReference")
+                rpr.append(rstyle)
+                vert_align = OxmlElement("w:vertAlign")
+                vert_align.set(qn("w:val"), "superscript")
+                rpr.append(vert_align)
+                fn_run.append(rpr)
+                fn_ref = OxmlElement("w:footnoteReference")
+                fn_ref.set(qn("w:id"), str(fn_id))
+                fn_run.append(fn_ref)
+                rebuilt_runs.append(fn_run)
+                fn_id += 1
+                footnote_to_text.append(ins_ref_text)
+                inserted_idx.append(len(footnote_to_text) - 1)
+                cursor = ins_end
+            # 剩余尾部文本
+            if cursor < len(new_text):
+                tail = OxmlElement("w:r")
+                tail_t = OxmlElement("w:t")
+                tail_t.text = new_text[cursor:]
+                tail_t.set(qn("xml:space"), "preserve")
+                tail.append(tail_t)
+                rebuilt_runs.append(tail)
+
+            # 清空原 w:t 内容
+            t.text = ""
+            insertion_offset = 0
+            for nr in rebuilt_runs:
+                parent_para.insert(run_index + 1 + insertion_offset, nr)
+                insertion_offset += 1
+
+    # 2. 构造 footnotes.xml（含孤儿文献提示）
+    # footnote 顺序按 footnote_to_text 列表
+    all_footnote_texts = footnote_to_text[:]
+    for orphan in orphan_refs:
+        all_footnote_texts.append(orphan)
+
+    if not all_footnote_texts:
+        return docx_bytes
+
+    # 3. 注册 footnotes part
+    _ensure_footnotes_part_with_texts(doc, all_footnote_texts, start_id=100)
+
+    # 4. 保存
+    output = io.BytesIO()
+    doc.save(output)
+    return output.getvalue()
+
+
+def _ensure_footnotes_part_with_texts(doc, footnote_texts: list[str], start_id: int = 100):
+    """构造 footnotes.xml，每条 footnote 仅包含文本 + FootnoteReference 上标样式。
+
+    与 _ensure_footnotes_part 区别：直接接收文本列表，不再依赖 (num, ref_text) 字典。
+    """
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.opc.part import Part
+    from docx.opc.packuri import PackURI
+
+    package = doc.part.package
+    footnotes_part = None
+    for rel in doc.part.rels.values():
+        if rel.reltype == RT.FOOTNOTES:
+            footnotes_part = rel.target_part
+            break
+
+    fn_xml_parts = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        f'<w:footnotes xmlns:w="{W_NS}">',
+        '  <w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>',
+        '  <w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>',
+    ]
+    for offset, text in enumerate(footnote_texts):
+        fn_id = start_id + offset
+        safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        fn_xml_parts.append(
+            f'  <w:footnote w:id="{fn_id}">'
+            f'<w:p><w:pPr><w:pStyle w:val="FootnoteText"/></w:pPr>'
+            f'<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/>'
+            f'<w:vertAlign w:val="superscript"/></w:rPr>'
+            f'<w:footnoteRef/></w:r>'
+            f'<w:r><w:t xml:space="preserve"> {safe_text}</w:t></w:r>'
+            f'</w:p></w:footnote>'
+        )
+    fn_xml_parts.append('</w:footnotes>')
+    fn_xml = "\n".join(fn_xml_parts).encode("utf-8")
+
+    if footnotes_part is None:
+        partname = PackURI("/word/footnotes.xml")
+        content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"
+        footnotes_part = Part(partname, content_type, fn_xml, package)
+        doc.part.relate_to(footnotes_part, RT.FOOTNOTES)
+    else:
+        footnotes_part._blob = fn_xml
+
+
 # ============ 6. 按需下载某格式文件 ============
 @app.get("/api/task/{internal_id}/format/{fmt}")
 async def download_format(internal_id: str, fmt: str):
@@ -1401,7 +1795,16 @@ async def download_format(internal_id: str, fmt: str):
         if references:
             print(f"[download_format] 找到 {len(references)} 条参考文献，开始处理 docx 脚注")
             try:
-                target_content = _process_docx_with_footnotes(target_content, references)
+                style = _detect_citation_style(md_content)
+                print(f"[download_format] 引用风格: {style}")
+                if style == "numeric":
+                    target_content = _process_docx_with_footnotes(target_content, references)
+                elif style == "author_year":
+                    target_content = _process_docx_with_author_year_footnotes(
+                        target_content, md_content, references
+                    )
+                else:
+                    print("[download_format] 未识别为有效引用模式，跳过脚注处理")
             except Exception as e:
                 print(f"[download_format] docx 脚注处理失败，返回原始 docx: {e}")
         else:
