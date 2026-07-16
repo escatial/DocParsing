@@ -1236,6 +1236,10 @@ def _process_docx_with_footnotes(docx_bytes: bytes, references: list[str]) -> by
                 rstyle = OxmlElement("w:rStyle")
                 rstyle.set(qn("w:val"), "FootnoteReference")
                 rpr.append(rstyle)
+                # 部分 Word/WPS 不会仅凭 FootnoteReference 样式自动显示上标，显式指定上标
+                vert_align = OxmlElement("w:vertAlign")
+                vert_align.set(qn("w:val"), "superscript")
+                rpr.append(vert_align)
                 fn_run.append(rpr)
                 fn_ref = OxmlElement("w:footnoteReference")
                 fn_ref.set(qn("w:id"), str(fn_id))
@@ -1307,7 +1311,8 @@ def _ensure_footnotes_part(doc, refs_dict: dict[int, str], inserted: list[int]):
         fn_xml_parts.append(
             f'  <w:footnote w:id="{fn_id}">'
             f'<w:p><w:pPr><w:pStyle w:val="FootnoteText"/></w:pPr>'
-            f'<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr>'
+            f'<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/>'
+            f'<w:vertAlign w:val="superscript"/></w:rPr>'
             f'<w:footnoteRef/></w:r>'
             f'<w:r><w:t xml:space="preserve"> {safe_text}</w:t></w:r>'
             f'</w:p></w:footnote>'
