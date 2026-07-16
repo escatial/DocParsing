@@ -1118,22 +1118,61 @@ def _extract_refs_dict_from_md(md: str) -> dict[int, str]:
     return refs_dict
 
 
+def _docx_bracket_refs(text: str) -> list[dict]:
+    """
+    在 docx 段落文本里扫描所有 [...] 引用，返回 [{start, end, nums}] 列表。
+    支持：[N] / [N-M] / [N,M,K] / [N－M] / [N—M] / [N~M]
+    返回的 nums 列表每个数字都是 references 字典里要查找的编号。
+    """
+    out: list[dict] = []
+    bracket_re = re.compile(
+        r"\[\s*"
+        r"(\d+)"
+        r"("
+        r"(?:\s*[\-－\u2013\u2014~]\s*\d+)"
+        r"|"
+        r"(?:\s*[,，\uff0c]\s*\d+)+"
+        r")*"
+        r"\s*\]"
+    )
+    for m in bracket_re.finditer(text):
+        body = m.group(0)
+        nums = [int(x) for x in re.findall(r"\d+", body)]
+        if not nums:
+            continue
+        if re.search(r"[\-－\u2013\u2014~]", body):
+            start, end = nums[0], nums[-1]
+            if end >= start:
+                nums = list(range(start, end + 1))
+            else:
+                nums = [start]
+        else:
+            seen = set()
+            dedup = []
+            for n in nums:
+                if n not in seen:
+                    dedup.append(n)
+                    seen.add(n)
+            nums = dedup
+        out.append({"start": m.start(), "end": m.end(), "nums": nums})
+    return out
+
+
 def _process_docx_with_footnotes(docx_bytes: bytes, references: list[str]) -> bytes:
     """
-    将 MinerU 生成的 docx 中的 [N] 引用转换为 Word 真实脚注。
+    将 MinerU 生成的 docx 中的 [N]/[N-M]/[N,M,K] 引用转换为 Word 真实脚注。
 
     参数:
         docx_bytes: 原始 docx 二进制（来自 MinerU）
-        references: 参考文献列表，索引即为编号（0 -> [1], 1 -> [2]...）
-                   每项可以是带 `[1]` 前缀的字符串，也可以是纯文本
+        references: 参考文献列表
 
     策略：
     1. 把 references 解析成 {num: text} 字典
-       - 如果项含 [N] 前缀，使用 N 作为编号
-       - 否则按列表索引作为编号（1-based）
     2. 在 docx 末尾插入 Footnote XML 部件
-    3. 把正文中每个 [N] 文本替换为 footnoteReference
-    4. 在 footnotes.xml 中添加对应的 footnote 节点（仅正文文本，不含 [N] 前缀）
+    3. 把正文中每个 [N] / [N-M] / [N,M,K] 文本替换为 footnoteReference
+       - [5-7] 展开为 3 个 footnoteReference（5, 6, 7）
+       - [1,3,5] 展开为 3 个 footnoteReference
+    4. 在 footnotes.xml 中添加对应的 footnote 节点
     """
     try:
         doc = Document(io.BytesIO(docx_bytes))
@@ -1147,13 +1186,11 @@ def _process_docx_with_footnotes(docx_bytes: bytes, references: list[str]) -> by
         ref = ref.strip()
         if not ref:
             continue
-        # 如果项带 [N] 前缀，使用 N 作为编号
         m = re.match(r"^\s*\[?(\d+)\]?[\.\s]*(.+)$", ref)
         if m:
             num = int(m.group(1))
             text = m.group(2).strip()
         else:
-            # 否则按列表索引（1-based）作为编号
             num = idx + 1
             text = ref
         refs_dict[num] = text
@@ -1164,65 +1201,33 @@ def _process_docx_with_footnotes(docx_bytes: bytes, references: list[str]) -> by
 
     print(f"[process_docx_footnotes] 解析到 {len(refs_dict)} 条参考文献，编号: {sorted(refs_dict.keys())[:10]}...")
 
-    # 1. 扫描文档中所有 [N] 文本
-    # python-docx 不直接支持正则替换 paragraph text，我们用 XML 操作
-    # 对每个段落，将 w:t 文本节点按 [N] 拆分，并在中间插入 footnoteReference
     body = doc.element.body
-    fn_id = 100  # 脚注 ID 起始值（避免与默认 0/1 冲突）
-    inserted: list[int] = []  # 已插入的编号列表
+    fn_id = 100
+    inserted: list[int] = []
 
-    # 遍历所有段落
     for p in body.iter(qn("w:p")):
-        # 收集段落的所有 w:r/w:t 节点
         runs_with_text = []
         for r in p.findall(qn("w:r")):
             for t in r.findall(qn("w:t")):
                 runs_with_text.append((r, t, t.text or ""))
-
         if not runs_with_text:
             continue
 
-        # 拼接段落文本，标记每个 t 的位置
-        full_text = ""
-        boundaries = []  # [(start, end, run, text_elem)]
-        for r, t, txt in runs_with_text:
-            start = len(full_text)
-            full_text += txt
-            boundaries.append((start, len(full_text), r, t))
-
-        # 找所有 [N]
-        pattern = re.compile(r"\[(\d+)\]")
-        matches = list(pattern.finditer(full_text))
-        if not matches:
-            continue
-
-        # 反向处理 matches（避免位置偏移）
-        # 这里采用简化策略：把 [N] 替换为脚注引用，保留原文本结构
-        # 由于跨 w:r 拆分复杂，我们直接对每个 w:t 节点单独处理
+        # 对每个 w:t 节点单独处理：[N-M] 这种范围在一个 w:t 里要完整替换
         for r, t, txt in runs_with_text:
             new_text = txt
-            sub_matches = list(pattern.finditer(new_text))
-            if not sub_matches:
+            bracket_matches = _docx_bracket_refs(new_text)
+            if not bracket_matches:
                 continue
-            # 在 t 后面依次插入 footnoteReference runs
-            # 简化：把 t 拆成多段，前后是 w:r/w:t，中间是 w:r/footnoteReference
-            # 先清空原 t 的内容
-            parent_run = t.getparent()  # w:r
-            parent_para = parent_run.getparent()  # w:p
+
+            parent_run = t.getparent()
+            parent_para = parent_run.getparent()
             run_index = list(parent_para).index(parent_run)
 
-            # 在 run_index 后插入新节点
-            cursor = run_index + 1
-            # 把原 t 的文本按 [N] 拆分
+            new_runs_to_insert: list = []
             cursor_text = 0
-            new_runs_to_insert = []
-            for sm in sub_matches:
-                num = int(sm.group(1))
-                if num not in refs_dict or num in inserted:
-                    # 引用不存在或已插入过 → 跳过替换（保留原文本）
-                    continue
-                # 前段文本
-                pre = new_text[cursor_text:sm.start()]
+            for bm in bracket_matches:
+                pre = new_text[cursor_text:bm["start"]]
                 if pre:
                     pre_run = OxmlElement("w:r")
                     pre_t = OxmlElement("w:t")
@@ -1230,25 +1235,29 @@ def _process_docx_with_footnotes(docx_bytes: bytes, references: list[str]) -> by
                     pre_t.set(qn("xml:space"), "preserve")
                     pre_run.append(pre_t)
                     new_runs_to_insert.append(pre_run)
-                # 脚注引用 run
-                fn_run = OxmlElement("w:r")
-                rpr = OxmlElement("w:rPr")
-                rstyle = OxmlElement("w:rStyle")
-                rstyle.set(qn("w:val"), "FootnoteReference")
-                rpr.append(rstyle)
-                # 部分 Word/WPS 不会仅凭 FootnoteReference 样式自动显示上标，显式指定上标
-                vert_align = OxmlElement("w:vertAlign")
-                vert_align.set(qn("w:val"), "superscript")
-                rpr.append(vert_align)
-                fn_run.append(rpr)
-                fn_ref = OxmlElement("w:footnoteReference")
-                fn_ref.set(qn("w:id"), str(fn_id))
-                fn_run.append(fn_ref)
-                new_runs_to_insert.append(fn_run)
-                inserted.append(num)
-                fn_id += 1
-                cursor_text = sm.end()
-            # 剩余文本
+                # 对每个有效 num 插入一个 footnoteReference
+                valid_nums = [n for n in bm["nums"] if n in refs_dict]
+                for num in valid_nums:
+                    if num in inserted:
+                        continue
+                    fn_run = OxmlElement("w:r")
+                    rpr = OxmlElement("w:rPr")
+                    rstyle = OxmlElement("w:rStyle")
+                    rstyle.set(qn("w:val"), "FootnoteReference")
+                    rpr.append(rstyle)
+                    # 部分 Word/WPS 不会仅凭 FootnoteReference 样式自动显示上标
+                    vert_align = OxmlElement("w:vertAlign")
+                    vert_align.set(qn("w:val"), "superscript")
+                    rpr.append(vert_align)
+                    fn_run.append(rpr)
+                    fn_ref = OxmlElement("w:footnoteReference")
+                    fn_ref.set(qn("w:id"), str(fn_id))
+                    fn_run.append(fn_ref)
+                    new_runs_to_insert.append(fn_run)
+                    inserted.append(num)
+                    fn_id += 1
+                cursor_text = bm["end"]
+
             rest = new_text[cursor_text:]
             if rest:
                 rest_run = OxmlElement("w:r")
@@ -1257,25 +1266,21 @@ def _process_docx_with_footnotes(docx_bytes: bytes, references: list[str]) -> by
                 rest_t.set(qn("xml:space"), "preserve")
                 rest_run.append(rest_t)
                 new_runs_to_insert.append(rest_run)
-            # 把 t 清空（保留为空），后续整段替换
             t.text = ""
-            # 在 parent_run 之后插入新 runs
             for offset, nr in enumerate(new_runs_to_insert):
                 parent_para.insert(run_index + 1 + offset, nr)
-            # 删除原 run（如果已无内容）
             if not any(rt.text for rt in parent_run.findall(qn("w:t"))):
                 parent_para.remove(parent_run)
 
     if not inserted:
-        print("[process_docx_footnotes] 文档中未找到任何 [N] 引用，未处理")
+        print("[process_docx_footnotes] 文档中未找到任何 [N]/[N-M]/[N,M,K] 引用，未处理")
         return docx_bytes
 
-    print(f"[process_docx_footnotes] 已插入 {len(inserted)} 个脚注引用，编号: {inserted[:5]}...")
+    print(f"[process_docx_footnotes] 已插入 {len(inserted)} 个脚注引用，编号: {inserted[:10]}...")
 
-    # 2. 注册 footnotes part（如果 docx 没有则新建）
+    # 注册 footnotes part
     _ensure_footnotes_part(doc, refs_dict, inserted)
 
-    # 3. 保存
     output = io.BytesIO()
     doc.save(output)
     return output.getvalue()
@@ -1461,13 +1466,20 @@ def _scan_author_year_in_md(
 def _detect_citation_style(md: str) -> str:
     """
     探测引用风格：
-    - 'numeric'    正文中有 [N] 形式
+    - 'numeric'    正文中有 [N] / [N-M] / [N,M,K] 等数字引用形式
     - 'author_year' 正文中有形如 (作者, 年份) 且文献列表含作者-年份
     - 'none'       都不匹配
     """
     if not md:
         return "none"
-    if re.search(r"\[\s*\d+\s*\]", md):
+    # 数字风格：单 [N]、范围 [N-M]、连续 [N,M,K]、[N－M]（全角短横）
+    numeric_pattern = re.compile(
+        r"\[\s*"
+        r"\d+"                                # 第一个数字
+        r"(?:\s*[\-－\u2013\u2014]\s*\d+|\s*[,\uff0c]\s*\d+)*"   # 后续 -M 或 ,M
+        r"\s*\]"
+    )
+    if numeric_pattern.search(md):
         return "numeric"
     if re.search(
         r"[\uff08\(]?\s*[\u4e00-\u9fff\w][\u4e00-\u9fff\w\.,\s]{0,30}?"
@@ -1477,6 +1489,51 @@ def _detect_citation_style(md: str) -> str:
     ):
         return "author_year"
     return "none"
+
+
+def _parse_inline_bracket_refs(text: str) -> list[tuple[int, int]]:
+    """
+    从一段文本里解析所有方括号引用，返回 [(start, end)] 区间列表。
+    支持：[N] / [N-M] / [N, M, K] / [N－M] / [N—M] / [N~M]
+    """
+    refs: list[tuple[int, int]] = []
+    # 用 lookahead / step 扫描整个匹配范围
+    bracket_re = re.compile(
+        r"\[\s*"
+        r"(\d+)"                              # 起始编号
+        r"((?:\s*[\-－\u2013\u2014~]\s*\d+)|(?:\s*[,，\uff0c]\s*\d+))*"  # 可选序列
+        r"\s*\]"
+    )
+    for m in bracket_re.finditer(text):
+        content = m.group(1) + (m.group(2) or "")
+        # 解析所有数字
+        num_strs = re.findall(r"\d+", content)
+        if not num_strs:
+            continue
+        try:
+            nums = [int(n) for n in num_strs]
+        except ValueError:
+            continue
+        # 区间 [5-7] → [5, 6, 7]；列表 [5,6,7] → [5, 6, 7]
+        # 检查是否含 '-' 或 '－' 等区间分隔符
+        if re.search(r"[\-－\u2013\u2014~]", content):
+            start = nums[0]
+            end = nums[-1]
+            if end >= start:
+                nums = list(range(start, end + 1))
+            else:
+                nums = [start]
+        # 简化列表：保留所有数字，去重
+        seen = set()
+        for n in nums:
+            if n not in seen:
+                refs.append((m.start(), m.end()))
+                seen.add(n)
+                break  # 每个 [N-M] 我们只生成一个区间（在 docx 里后续会一次性替换）
+        # 但为了完整性，单独数字也要生成 [start, end]
+        if not refs or refs[-1][0] != m.start():
+            refs.append((m.start(), m.end()))
+    return refs
 
 
 def _split_multi_refs(bracket_content: str) -> list[str]:
