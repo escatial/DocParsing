@@ -1834,6 +1834,9 @@ async def download_format(internal_id: str, fmt: str):
         raise HTTPException(404, f"该任务结果中未包含 .{fmt} 格式（解析时未启用 extra_formats 或 MinerU 未生成）")
 
     # docx 特殊处理：把 [N] 引用替换为真实 Word 脚注 + 使用文章标题作为下载文件名
+    # 公式按用户要求**保持原样**，不转 Word 自带 OMML；
+    # MinerU 输出 LaTeX 字符串（通常已用 $$...$$ 或 \[...\] 包裹），
+    # 用户手动复制到 MathType。
     download_name = target_name  # 默认 = full.docx
     if fmt == "docx":
         # 策略 1：提取文章标题

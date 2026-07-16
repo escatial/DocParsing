@@ -2,7 +2,10 @@ import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import rehypeSanitize from 'rehype-sanitize';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
+import 'katex/dist/katex.min.css';
 import {
   Upload,
   FileText,
@@ -56,6 +59,29 @@ const STAGE_LIST: { id: WorkflowStage; label: string; icon: typeof Upload }[] = 
   { id: 'converting', label: '格式转换', icon: Sparkles },
   { id: 'done', label: '完成', icon: FileCheck },
 ];
+// KaTeX 渲染需要的 sanitize schema 扩展
+// rehype-sanitize 默认会清除 KaTeX 生成的 <span class="katex"> 与 <math> 节点
+// 这里扩展允许列表，仅白名单 KaTeX 相关 class
+const katexSanitizeSchema = {
+  ...defaultSchema,
+  tagNames: [...(defaultSchema.tagNames ?? []), 'math', 'annotation', 'semantics', 'mrow', 'mi', 'mn', 'mo', 'ms', 'mtext', 'msub', 'msup', 'mfrac', 'msqrt', 'mover', 'munder', 'munderover', 'mtable', 'mtr', 'mtd'],
+  attributes: {
+    ...(defaultSchema.attributes ?? {}),
+    '*': [
+      ...(defaultSchema.attributes?.['*'] ?? []),
+      ['className', /^katex/, /^math/, /^mord/, /^mbin/, /^mrel/, /^mopen/, /^mclose/, /^mpunct/, /^minner/],
+      'style',
+      'aria-hidden',
+      'role',
+    ],
+    span: [
+      ...(defaultSchema.attributes?.span ?? []),
+      ['className', /^katex/, /^math/, /^mord/, /^mbin/, /^mrel/, /^mopen/, /^mclose/, /^mpunct/, /^minner/, /^(top|bottom|left|right|fixed|token|displaystyle|mathbb)/],
+    ],
+    math: [['xmlns', 'http://www.w3.org/1998/Math/MathML']],
+    annotation: [['encoding', 'application/x-tex']],
+  },
+};
 
 // 子阶段
 const SUB_STAGE_LIST: {
@@ -751,7 +777,10 @@ export default function App() {
               </div>
               <article className="markdown-body max-w-none max-h-[70vh] overflow-y-auto">
                 {(currentResult ?? selectedBatchResult)?.markdown ? (
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm, remarkMath]}
+                    rehypePlugins={[[rehypeSanitize, katexSanitizeSchema], rehypeKatex]}
+                  >
                     {(currentResult ?? selectedBatchResult)!.markdown}
                   </ReactMarkdown>
                 ) : (

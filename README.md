@@ -14,6 +14,7 @@
 ## ✨ 核心功能
 
 ### 解析能力
+
 - **多格式输入**：PDF、Word、PPT、Excel、图片（png/jpg/webp 等）、HTML
 - **多模型支持**：`vlm`（高精度 90+） / `pipeline`（CPU 友好）
 - **可选能力**：OCR 识别、公式识别（LaTeX）、表格识别（HTML）
@@ -22,6 +23,8 @@
 - **Markdown 预览**：在线渲染完整 Markdown（含表格/代码块/列表/GFM 语法）
 - **大纲提取**：自动从文档中提取章节结构（按 Markdown 标题层级）
 - **参考文献识别**：自动识别"参考文献"章节并提取条目
+- **公式渲染（KaTeX）**：Markdown 中的 `$...$` 行内公式与 `$$...$$` 块级公式可正常显示（依赖 MinerU 的 `enable_formula` 输出）
+- **公式输出策略**：公式保留为 LaTeX 字符串（默认 `$$...$$` 包裹），**不转换为 Word 自带 OMML**——便于用户手动复制到 MathType
 - **Word 导出 + 脚注自动化**：
   - 支持 `[N]` 数字引用 → 真实 Word 脚注（点击跳转）
   - 支持 `[N-M]` / `[N,M,K]` / `[5－7]` 等区间/并列格式
@@ -31,6 +34,7 @@
   - 上标效果显式设置（部分 Word/WPS 兼容）
 
 ### 工作流特性
+
 - **单文件 / 批量解析**（最多 10 个文件）
 - **确认按钮工作流**：选择文件 → 预览确认 → 提交解析（避免误操作）
 - **5 段进度可视化**：预览 → 上传 → 解析 → 转换 → 完成
@@ -68,12 +72,14 @@
 ## 🚀 启动步骤
 
 ### 1. 创建 conda 环境
+
 ```bash
 conda create -n DocParsing python=3.11 -y
 conda activate DocParsing
 ```
 
 ### 2. 安装并启动后端
+
 ```bash
 cd backend
 pip install -r requirements.txt
@@ -81,12 +87,14 @@ python -m uvicorn main:app --reload --port 8000
 ```
 
 > Token 已内置在 `main.py` 中。如需自定义：
+>
 > ```bash
 > # backend/.env
 > MINERU_TOKEN=your_token_here
 > ```
 
 ### 3. 安装并启动前端
+
 ```bash
 cd frontend
 npm install
@@ -112,6 +120,7 @@ npm run dev
 ```
 
 后端核心代理层把 MinerU API 的 `batch_id` 和单文件 `task_id` 做了统一封装：
+
 - 上传成功后 MinerU 自动创建任务
 - 轮询必须用 `/extract-results/batch/{batch_id}` 端点
 - 响应结构是 `extract_result[0]` 列表
@@ -119,43 +128,45 @@ npm run dev
 ## 🛠 技术栈
 
 ### 后端
-| 技术 | 用途 |
-|---|---|
-| `FastAPI + uvicorn` | 异步 API 服务 |
-| `httpx` | 异步 HTTP 客户端，调用 MinerU |
-| `asyncio.gather` | 批量文件并行上传 |
-| `pydantic v2` | 数据模型 + 验证 |
-| `zipfile + io` | 流式解压 MinerU 结果 ZIP |
-| `正则表达式` | 从 Markdown 兜底提取大纲和参考文献 |
+
+| 技术                  | 用途                               |
+| --------------------- | ---------------------------------- |
+| `FastAPI + uvicorn` | 异步 API 服务                      |
+| `httpx`             | 异步 HTTP 客户端，调用 MinerU      |
+| `asyncio.gather`    | 批量文件并行上传                   |
+| `pydantic v2`       | 数据模型 + 验证                    |
+| `zipfile + io`      | 流式解压 MinerU 结果 ZIP           |
+| `正则表达式`        | 从 Markdown 兜底提取大纲和参考文献 |
 
 ### 前端
-| 技术 | 用途 |
-|---|---|
-| `React 18 + TypeScript` | 主流技术栈 |
-| `Vite` | 快速构建 + 内置 `/api` 代理 |
-| `Tailwind CSS` | 原子化样式 |
-| `React Query (TanStack Query)` | 轮询 + 缓存 + 错误处理 |
+
+| 技术                                              | 用途                            |
+| ------------------------------------------------- | ------------------------------- |
+| `React 18 + TypeScript`                         | 主流技术栈                      |
+| `Vite`                                          | 快速构建 + 内置`/api` 代理    |
+| `Tailwind CSS`                                  | 原子化样式                      |
+| `React Query (TanStack Query)`                  | 轮询 + 缓存 + 错误处理          |
 | `react-markdown + remark-gfm + rehype-sanitize` | Markdown 渲染（GFM + XSS 防护） |
-| `lucide-react` | 现代图标库 |
-| `useState + useEffect + useRef` | 工作流状态机 |
-| `ErrorBoundary` | 异常兜底 |
+| `lucide-react`                                  | 现代图标库                      |
+| `useState + useEffect + useRef`                 | 工作流状态机                    |
+| `ErrorBoundary`                                 | 异常兜底                        |
 
 ## 🐛 Bug 修复记录
 
-| Bug | 原因 | 修复 |
-|---|---|---|
-| `404 task not found` | 单文件 API 查询路径用了 `/extract/task/{id}`，但批量上传的 batch_id 必须用 `/extract-results/batch/{id}` | 切换查询端点 + 解析 `extract_result[0]` |
-| `500 UnicodeEncodeError` | ZIP 下载时文件名含中文 | 使用 RFC 5987 `filename*=UTF-8''...` |
-| `Pydantic UserWarning model_*` | 字段名 `model_version` 触发保护命名空间 | 添加 `model_config = {"protected_namespaces": ()}` |
-| `react-markdown sentence undefined` | react-markdown v9 + remark-gfm v4 + react 18 偶发 | 锁定精确版本 + 加 `rehype-sanitize` |
-| 持续 500 循环 | MinerU 临时不可用 | try-except 返回上次缓存状态 |
-| 渲染时 setState 崩溃 | `if (X) setState(...)` 写在组件函数体内 | 改为 `useEffect` |
-| `STATE_PILL[undefined].bg` 崩溃 | 后端返回未知 state | 添加 `getPill()` 兜底函数 |
-| 批量只能预览第一个文件 | 文件区不可点击 | 改为可点击切换的 `<button>` |
-| 识别完成无法下载 Word | 批量模式下载按钮没显示 + 响应头中文异常 | 修前端 + 加 ASCII fallback |
-| 脚注不是上标 | 部分 Word/WPS 不自动套用 `FootnoteReference` 样式 | 显式加 `<w:vertAlign w:val="superscript"/>` |
-| 正文卡在「上传文件」 | 后端同步等待 MinerU 上传 | 移到后台任务，立即返回 `internal_id` |
-| 参考文献列表死循环 MinerU 502 | 8000 端口被旧进程占用 | 重启后端即可，提供更详细日志 |
+| Bug                                   | 原因                                                                                                        | 修复                                                |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `404 task not found`                | 单文件 API 查询路径用了`/extract/task/{id}`，但批量上传的 batch_id 必须用 `/extract-results/batch/{id}` | 切换查询端点 + 解析`extract_result[0]`            |
+| `500 UnicodeEncodeError`            | ZIP 下载时文件名含中文                                                                                      | 使用 RFC 5987`filename*=UTF-8''...`               |
+| `Pydantic UserWarning model_*`      | 字段名`model_version` 触发保护命名空间                                                                    | 添加`model_config = {"protected_namespaces": ()}` |
+| `react-markdown sentence undefined` | react-markdown v9 + remark-gfm v4 + react 18 偶发                                                           | 锁定精确版本 + 加`rehype-sanitize`                |
+| 持续 500 循环                         | MinerU 临时不可用                                                                                           | try-except 返回上次缓存状态                         |
+| 渲染时 setState 崩溃                  | `if (X) setState(...)` 写在组件函数体内                                                                   | 改为`useEffect`                                   |
+| `STATE_PILL[undefined].bg` 崩溃     | 后端返回未知 state                                                                                          | 添加`getPill()` 兜底函数                          |
+| 批量只能预览第一个文件                | 文件区不可点击                                                                                              | 改为可点击切换的`<button>`                        |
+| 识别完成无法下载 Word                 | 批量模式下载按钮没显示 + 响应头中文异常                                                                     | 修前端 + 加 ASCII fallback                          |
+| 脚注不是上标                          | 部分 Word/WPS 不自动套用`FootnoteReference` 样式                                                          | 显式加`<w:vertAlign w:val="superscript"/>`        |
+| 正文卡在「上传文件」                  | 后端同步等待 MinerU 上传                                                                                    | 移到后台任务，立即返回`internal_id`               |
+| 参考文献列表死循环 MinerU 502         | 8000 端口被旧进程占用                                                                                       | 重启后端即可，提供更详细日志                        |
 
 ## 📋 已知限制
 

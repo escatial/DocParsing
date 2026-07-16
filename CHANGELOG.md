@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] - 2026-07
+
+### Added
+- Markdown 预览区支持 KaTeX 公式渲染（行内 `$...$` / 块级 `$$...$$`）
+- 公式输出策略：保留 LaTeX 字符串原样，用户可手动复制到 MathType
+
+### Dependencies
+- 前端新增：`remark-math@6`、`rehype-katex@7`、`katex@0.16`
+
 ## [1.0.1] - 2026-07
 
 ### Added
