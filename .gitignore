@@ -4,6 +4,11 @@
 .coverage
 htmlcov/
 
+# IDE / 编辑器本地数据
+.trae/
+.idea/
+.vscode/
+
 # 系统
 Thumbs.db
 .DS_Store

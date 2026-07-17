@@ -1078,6 +1078,290 @@ def _extract_refs_from_markdown(md: str) -> list[str]:
     return refs[:50]  # 最多 50 条防溢出
 
 
+# ============ Markdown → Docx 构造器 ============
+
+def _md_inline_to_runs(parent_para, text: str):
+    """
+    将一行 inline 文本写入 paragraph，处理：
+    - `code` -> 单字号字体段落样式（CodeInline）
+    - 数学保留为 LaTeX 文本（不转 OMML），用 $$...$$ 包裹
+    - 其它保留原文
+    """
+    if not text:
+        return
+    # 行内代码 `code`
+    parts = re.split(r"(`[^`]+`)", text)
+    for part in parts:
+        if part.startswith("`") and part.endswith("`") and len(part) > 2:
+            run = parent_para.add_run(part[1:-1])
+            run.font.name = "Consolas"
+        else:
+            parent_para.add_run(part)
+
+
+def _md_block_to_paragraphs(doc, block_text: str, first_line: bool = False):
+    """
+    把 markdown 中的「块」根据第一行特征分类处理：
+    - # / ## / ### / ####：标题
+    - ![alt](url)：图片（docx 不直接支持，跳过）
+    - 表格 / 列表：单独处理
+    - 含 $$...$$：把整块公式作为独立段落（纯文本 LaTeX）
+    - 普通段落
+    """
+    lines = block_text.split("\n")
+    if not lines:
+        return
+    first = lines[0].rstrip()
+    # 标题
+    m = re.match(r"^(#{1,6})\s+(.+)$", first)
+    if m and len(m.group(2)) > 0:
+        level = len(m.group(1))
+        doc.add_heading(m.group(2), level=min(level, 4))
+        # 后续行作为段落内容（罕见）
+        rest = "\n".join(lines[1:]).strip()
+        if rest:
+            para = doc.add_paragraph()
+            _md_inline_to_runs(para, rest)
+        return
+    # 数学块 $$...$$ 整段作为公式
+    block_full = block_text.strip()
+    if block_full.startswith("$$") and block_full.endswith("$$"):
+        para = doc.add_paragraph()
+        run = para.add_run(block_full)
+        run.font.name = "Cambria Math"
+        run.italic = True
+        return
+    # 普通段落
+    para = doc.add_paragraph()
+    _md_inline_to_runs(para, block_text.replace("\n", " "))
+
+
+def _md_table_to_docx(doc, table_lines: list[str]):
+    """
+    将 markdown 表格行转为 docx 表格。
+    输入是连续的表格行（含表头、分隔线、数据行）。
+    """
+    if len(table_lines) < 2:
+        return
+    header_cells = [c.strip() for c in table_lines[0].strip().strip("|").split("|")]
+    # 跳过 |---| 分隔
+    rows_cells = []
+    for line in table_lines[2:]:
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        rows_cells.append(cells)
+    table = doc.add_table(rows=1 + len(rows_cells), cols=len(header_cells))
+    table.style = "Light Grid"
+    # 表头
+    hdr = table.rows[0]
+    for i, name in enumerate(header_cells):
+        if i < len(hdr.cells):
+            hdr.cells[i].text = name
+            for p in hdr.cells[i].paragraphs:
+                for r in p.runs:
+                    r.bold = True
+    # 数据
+    for ri, row in enumerate(rows_cells):
+        for i, txt in enumerate(row):
+            if i < len(table.rows[ri + 1].cells):
+                table.rows[ri + 1].cells[i].text = txt
+
+
+def _md_list_to_paragraphs(doc, list_lines: list[str]):
+    """
+    将 markdown 列表行转为 docx 列表段落。
+    支持 - 和 1. 两种风格。
+    """
+    style = "List Bullet" if list_lines[0].lstrip().startswith("-") else "List Number"
+    for line in list_lines:
+        line = line.strip()
+        # 去掉列表前缀
+        if line.startswith("- "):
+            content = line[2:]
+        elif re.match(r"^\d+\.\s", line):
+            content = re.sub(r"^\d+\.\s+", "", line)
+        else:
+            content = line
+        para = doc.add_paragraph(style=style)
+        _md_inline_to_runs(para, content)
+
+
+def _split_markdown_into_blocks(md: str) -> list[tuple[str, list[str]]]:
+    """
+    把 markdown 拆为连续的「块」：
+    - ("p", ["段落行1", ...])
+    - ("code", ["代码块行"])
+    - ("table", ["表头", "分隔", "数据行", ...])
+    - ("list", ["- item1", "- item2"])
+    - ("formula", ["$$...$$"])
+    """
+    blocks: list[tuple[str, list[str]]] = []
+    lines = md.split("\n")
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        # 跳过空行
+        if not stripped:
+            i += 1
+            continue
+        # 代码块 ```
+        if stripped.startswith("```"):
+            j = i + 1
+            cur = [line]
+            while j < n and not lines[j].strip().startswith("```"):
+                cur.append(lines[j])
+                j += 1
+            if j < n:
+                cur.append(lines[j])
+            blocks.append(("code", cur))
+            i = j + 1
+            continue
+        # 公式块 $$...$$
+        if stripped == "$$" or stripped.startswith("$$") or stripped.endswith("$$"):
+            # 单行 $$...$$  或多行
+            if stripped.startswith("$$") and (stripped.endswith("$$") or "$$" in stripped[2:]):
+                # 单行包含两个 $$
+                blocks.append(("formula", [line]))
+                i += 1
+                continue
+            elif stripped == "$$":
+                # 多行
+                cur = [line]
+                j = i + 1
+                while j < n and lines[j].strip() != "$$":
+                    cur.append(lines[j])
+                    j += 1
+                if j < n:
+                    cur.append(lines[j])
+                blocks.append(("formula", cur))
+                i = j + 1
+                continue
+        # 表格 |...|
+        if "|" in stripped and stripped.startswith("|") and stripped.endswith("|"):
+            cur = [line]
+            j = i + 1
+            # 第二行必须是 |---|...| 分隔
+            if j < n and re.match(r"^\s*\|[\s\-|:]+\|\s*$", lines[j]):
+                cur.append(lines[j])
+                j += 1
+                while j < n and lines[j].strip().startswith("|"):
+                    cur.append(lines[j])
+                    j += 1
+                blocks.append(("table", cur))
+                i = j
+                continue
+            else:
+                # 不符合表格结构，走段落
+                pass
+        # 列表
+        if re.match(r"^\s*([-*]|\d+\.)\s+", line):
+            cur = [line]
+            j = i + 1
+            while j < n and re.match(r"^\s*([-*]|\d+\.)\s+", lines[j]):
+                cur.append(lines[j])
+                j += 1
+            blocks.append(("list", cur))
+            i = j
+            continue
+        # 普通段落：取连续非空行
+        cur = [line]
+        j = i + 1
+        while j < n:
+            nxt = lines[j].rstrip()
+            if not nxt:
+                break
+            # 下行是代码块/表格/列表/标题 → 段落终止
+            if (nxt.startswith("```") or
+                nxt.startswith("|") or
+                re.match(r"^\s*([-*]|\d+\.)\s+", nxt) or
+                nxt.startswith("#") or
+                nxt.startswith("$$") or
+                re.match(r"^\s*#{1,6}\s+\S", nxt)):
+                break
+            cur.append(lines[j])
+            j += 1
+        blocks.append(("p", cur))
+        i = j
+    return blocks
+
+
+def _build_docx_from_markdown(
+    md_content: str,
+    title: str = "",
+    references: list[str] | None = None,
+) -> bytes:
+    """
+    从 full.md 完整构造 docx：
+    - 文字段落保留 LaTeX 公式（不转 OMML）
+    - 块级数学公式作为独立段落，纯文本
+    - 表格 / 列表 / 标题按 markdown 规范翻译
+    - 参考文献列表（可选）作为附录
+    """
+    doc = Document()
+    # 设置基础样式
+    style = doc.styles["Normal"]
+    style.font.name = "Times New Roman"
+    style.font.size = Pt(12)
+
+    if title:
+        doc.add_heading(title, 0)
+
+    blocks = _split_markdown_into_blocks(md_content)
+    for kind, lines in blocks:
+        if kind == "code":
+            text = "\n".join(lines[1:-1])
+            para = doc.add_paragraph()
+            run = para.add_run(text)
+            run.font.name = "Consolas"
+            run.font.size = Pt(10)
+        elif kind == "formula":
+            full = " ".join(line.strip() for line in lines)
+            full = re.sub(r"\s+", " ", full).strip()
+            # 简化为单条 $$...$$
+            para = doc.add_paragraph()
+            run = para.add_run(full)
+            run.font.name = "Cambria Math"
+            run.italic = True
+        elif kind == "table":
+            _md_table_to_docx(doc, lines)
+        elif kind == "list":
+            _md_list_to_paragraphs(doc, lines)
+        else:  # "p"
+            text = "\n".join(lines)
+            # 处理段落内的行内 $$...$$
+            if "$$" in text:
+                # 按 $$...$$ 拆：普通段 + 公式段交替
+                segs = re.split(r"\$\$(.+?)\$\$", text, flags=re.S)
+                for idx, seg in enumerate(segs):
+                    if idx % 2 == 1:
+                        # 公式段
+                        para = doc.add_paragraph()
+                        run = para.add_run(f"$$ {seg.strip()} $$")
+                        run.font.name = "Cambria Math"
+                        run.italic = True
+                    else:
+                        if seg.strip():
+                            para = doc.add_paragraph()
+                            _md_inline_to_runs(para, seg.strip())
+            else:
+                para = doc.add_paragraph()
+                _md_inline_to_runs(para, text)
+
+    # 参考文献作为附录
+    if references:
+        doc.add_heading("参考文献", 1)
+        for i, ref in enumerate(references):
+            ref_text = re.sub(r"^\s*\[?\d+\]?\s*[.,]?\s*", "", ref).strip()
+            para = doc.add_paragraph()
+            run = para.add_run(ref_text)
+            run.font.size = Pt(11)
+
+    output = io.BytesIO()
+    doc.save(output)
+    return output.getvalue()
+
+
 # ============ Docx 脚注后处理 ============
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -1116,6 +1400,27 @@ def _extract_refs_dict_from_md(md: str) -> dict[int, str]:
             if m:
                 refs_dict[int(m.group(1))] = m.group(2).strip()
     return refs_dict
+
+
+def _strip_references_section(md: str) -> str:
+    """移除 md_content 中末尾的“参考文献/References”章节，避免重复。
+    返回去除后的文本。
+    """
+    lines = md.split("\n")
+    out = []
+    skip = False
+    for line in lines:
+        stripped = line.strip()
+        # 参考文献起始行：# / ## / ### 加“参考文献/References”
+        if re.match(r"^#{1,3}\s*(参考文献|References?|Bibliography|引用文献|REFERENCES)", stripped, re.I):
+            skip = True
+            continue
+        # 下一个一级标题出现 → 恢复保留
+        if skip and re.match(r"^#{1,3}\s+", stripped):
+            skip = False
+        if not skip:
+            out.append(line)
+    return "\n".join(out)
 
 
 def _docx_bracket_refs(text: str) -> list[dict]:
@@ -1833,10 +2138,10 @@ async def download_format(internal_id: str, fmt: str):
     if target_content is None:
         raise HTTPException(404, f"该任务结果中未包含 .{fmt} 格式（解析时未启用 extra_formats 或 MinerU 未生成）")
 
-    # docx 特殊处理：把 [N] 引用替换为真实 Word 脚注 + 使用文章标题作为下载文件名
-    # 公式按用户要求**保持原样**，不转 Word 自带 OMML；
-    # MinerU 输出 LaTeX 字符串（通常已用 $$...$$ 或 \[...\] 包裹），
+    # docx 特殊处理：使用 [N] 引用替换为真实 Word 脚注 + 文章标题作为下载文件名
+    # 公式**重新生成 docx 时保留 LaTeX 字符串原样**（不转 OMML）；
     # 用户手动复制到 MathType。
+    # 实现：从 full.md 自行构造 docx（不依赖 MinerU 输出的 docx，因为 MinerU 会转 OMML）
     download_name = target_name  # 默认 = full.docx
     if fmt == "docx":
         # 策略 1：提取文章标题
@@ -1868,36 +2173,53 @@ async def download_format(internal_id: str, fmt: str):
         references = _extract_refs_from_markdown(md_content)
         print(f"[download_format] md_content 长度: {len(md_content)} | 解析到参考文献: {len(references)} 条")
         if md_content:
-            # 取 md_content 前 300 字符以便诊断
             md_preview = md_content[:300].replace("\n", " ")
             print(f"[download_format] md_preview: {md_preview!r}")
-        if references:
-            print(f"[download_format] 找到 {len(references)} 条参考文献，开始处理 docx 脚注")
-            print(f"[download_format] 前 3 条参考文献: {references[:3]}")
+
+        # 优先用 full.md 自行构造 docx（保证公式保留为 LaTeX 字符串）
+        # 仅当 md_content 非空且解析成功时使用；否则降级用 MinerU 输出
+        use_self_built = bool(md_content and md_content.strip())
+        if use_self_built:
             try:
-                style = _detect_citation_style(md_content)
-                print(f"[download_format] 引用风格: {style}")
-                if style == "numeric":
-                    target_content = _process_docx_with_footnotes(target_content, references)
-                elif style == "author_year":
-                    target_content = _process_docx_with_author_year_footnotes(
-                        target_content, md_content, references
-                    )
-                else:
-                    # 兜底：如果有 [N] 形式的引用但 md 中看不到 references 头部，仍尝试数字脚注
-                    print("[download_format] 风格未识别，尝试以数字脚注兜底")
-                    target_content = _process_docx_with_footnotes(target_content, references)
+                # 移除参考文献章节（避免重复，因为构造器会自己添加 references 列表）
+                md_for_docx = _strip_references_section(md_content)
+                # 过滤掉文献列表项：[1] xxx 这种行不应出现在正文中
+                target_content = _build_docx_from_markdown(
+                    md_content=md_for_docx,
+                    title=title,
+                    references=references if references else None,
+                )
+                print(f"[download_format] 已从 full.md 自行构造 docx（公式保持 LaTeX 字符串）")
+                # 跳过原有 MinerU docx 输出（不再依赖 target_content）
+                download_name_used = download_name
             except Exception as e:
-                print(f"[download_format] docx 脚注处理失败，返回原始 docx: {e}")
-        elif md_content:
-            # 没找到 references 但 md_content 存在 → 看看是否有 [N] 脚注
-            if re.search(r"\[\d+\]", md_content):
+                print(f"[download_format] 自行构造 docx 失败: {e}，降级用 MinerU 输出")
+                use_self_built = False
+
+        if not use_self_built:
+            # 降级方案：使用 MinerU 输出，但需做脚注处理
+            if references:
+                print(f"[download_format] 找到 {len(references)} 条参考文献，开始处理 docx 脚注")
+                print(f"[download_format] 前 3 条参考文献: {references[:3]}")
+                try:
+                    style = _detect_citation_style(md_content)
+                    print(f"[download_format] 引用风格: {style}")
+                    if style == "numeric":
+                        target_content = _process_docx_with_footnotes(target_content, references)
+                    elif style == "author_year":
+                        target_content = _process_docx_with_author_year_footnotes(
+                            target_content, md_content, references
+                        )
+                    else:
+                        print("[download_format] 风格未识别，尝试以数字脚注兜底")
+                        target_content = _process_docx_with_footnotes(target_content, references)
+                except Exception as e:
+                    print(f"[download_format] docx 脚注处理失败，返回原始 docx: {e}")
+            elif md_content and re.search(r"\[\d+\]", md_content):
                 print("[download_format] md 有 [N] 但未提取到 references，尝试空脚注处理")
                 target_content = _process_docx_with_footnotes(target_content, [])
-            else:
-                print("[download_format] 未找到参考文献，跳过脚注处理")
-        else:
-            print("[download_format] 未找到 md_content 也未找到参考文献，跳过脚注处理")
+            elif not md_content:
+                print("[download_format] 无 md_content，跳过")
 
     media_types = {
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
